@@ -34,10 +34,17 @@ jobs:
         run: uv run ruff format --check
       - name: Type check
         run: uv run mypy
+      # The BPF devices belong to root. Opening them to everyone on this
+      # throwaway runner, much as Wireshark's ChmodBPF does for one group,
+      # lets the loopback capture tests run instead of skipping.
+      - name: Allow packet capture without root
+        run: sudo chmod o+rw /dev/bpf*
       - name: Test
         run: uv run pytest
       - name: Smoke test the command line tool
-        run: uv run pilotfish --version
+        run: |
+          uv run pilotfish --version
+          uv run pilotfish interfaces
 
   # Parsers work on bytes and never touch the OS, so they run on Linux too.
   # This job installs no extras, which also proves the core installs without Qt.

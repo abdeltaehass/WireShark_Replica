@@ -52,6 +52,20 @@ _NAMES: dict[int, str] = {
 }
 
 
+# Live capture handles report DLT_ values from the platform's <net/bpf.h>.
+# Most equal the LINKTYPE_ value for the same header; these are the macOS
+# exceptions.
+_DLT_TO_LINKTYPE: dict[int, int] = {
+    12: 101,  # DLT_RAW
+    149: 258,  # DLT_PKTAP, which macOS defines as DLT_USER2
+}
+
+
 def link_type_name(link_type: int) -> str:
     """The registry name without its ``LINKTYPE_`` prefix, such as ``ETHERNET``."""
     return _NAMES.get(link_type, f"LINKTYPE_{link_type}")
+
+
+def link_type_from_dlt(dlt: int) -> int:
+    """The LINKTYPE value for a DLT value that a live capture on macOS reports."""
+    return _DLT_TO_LINKTYPE.get(dlt, dlt)
