@@ -25,6 +25,8 @@ build-backend = "uv_build"
 
 [tool.ruff]
 line-length = 100
+# Test helpers such as tests/builders.py import as first-party modules.
+src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "N", "UP", "B", "SIM", "PT", "RUF", "TID"]
@@ -40,12 +42,13 @@ select = ["E", "W", "F", "I", "N", "UP", "B", "SIM", "PT", "RUF", "TID"]
 [tool.mypy]
 strict = true
 python_version = "3.12"
-files = ["src", "tests"]
+files = ["src", "tests", "scripts"]
 warn_unreachable = true
 enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["tests"]
 addopts = ["--import-mode=importlib", "--strict-markers", "--strict-config", "-ra"]
 xfail_strict = true
 filterwarnings = ["error"]
