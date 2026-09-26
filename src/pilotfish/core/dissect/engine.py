@@ -12,6 +12,7 @@ from pilotfish.core.dissect.dissector import (
 from pilotfish.core.dissect.errors import MalformedError
 from pilotfish.core.dissect.fields import Field, FieldType
 from pilotfish.core.dissect.reader import Reader
+from pilotfish.core.dissect.session import Session
 from pilotfish.core.dissect.tree import ProtocolTree
 from pilotfish.core.packet import Packet
 
@@ -83,15 +84,23 @@ def as_data(payload: Buffer) -> Handoff:
     return Handoff(DATA_TABLE, 0, payload)
 
 
-def dissect(packet: Packet, number: int = 1, registry: Registry = REGISTRY) -> ProtocolTree:
+def dissect(
+    packet: Packet,
+    number: int = 1,
+    registry: Registry = REGISTRY,
+    session: Session | None = None,
+) -> ProtocolTree:
     """Decode one packet, layer by layer, into a tree of fields.
 
     A packet that doesn't hold what its headers claim doesn't raise: decoding
     stops where the bytes ran out, the tree keeps every field read up to
     there, and ``tree.error`` says what happened.
+
+    Pass the same ``session`` for every packet of a capture, and the
+    dissectors that follow connections can see what came before.
     """
     tree = ProtocolTree()
-    context = Context(packet=packet, number=number)
+    context = Context(packet=packet, number=number, session=session or Session())
     registry.add(Data, DATA_TABLE, (0,))
     dissector: Dissector | None = registry.add(Frame)
     payload = Buffer(packet.data)
@@ -112,10 +121,26 @@ def dissect(packet: Packet, number: int = 1, registry: Registry = REGISTRY) -> P
         if len(tree.layers) >= MAX_LAYERS:
             tree.error = f"stopped after {MAX_LAYERS} layers"
             break
-        dissector = registry.find(handoff.table, handoff.key) or registry.add(Data)
+        dissector = handoff.dissector or _route(handoff, registry, context) or registry.add(Data)
         payload = handoff.payload
     tree.info = context.info or _summary(tree)
     return tree
+
+
+def _route(handoff: Handoff, registry: Registry, context: Context) -> Dissector | None:
+    """The dissector for a handoff: by value, else by asking the heuristics.
+
+    A transport protocol hands over both of its ports, lower one first, which
+    is the order Wireshark tries them in, so a well-known port wins over the
+    ephemeral one at the other end.
+    """
+    for key in (handoff.key, *handoff.also):
+        found = registry.find(handoff.table, key)
+        if found is not None:
+            return found
+    if not handoff.heuristics:
+        return None
+    return registry.guess(handoff.heuristics, handoff.payload, context)
 
 
 def _name_protocol(tree: ProtocolTree, dissector: Dissector, quoted: bool) -> None:

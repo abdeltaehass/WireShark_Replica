@@ -8,12 +8,24 @@ runs out in the middle of one.
 
 import struct
 from ipaddress import IPv4Address, IPv6Address
+from typing import Any
 
 import pytest
 
 import pilotfish.core.protocols  # noqa: F401  (registers the dissectors)
-from packets import ethernet, icmp, icmp_echo, icmpv6, ipv4, ipv6, udp
-from pilotfish.core.dissect import ProtocolTree, dissect
+from packets import (
+    checksum,
+    ethernet,
+    icmp,
+    icmp_echo,
+    icmpv6,
+    ipv4,
+    ipv6,
+    pseudo_header,
+    tcp,
+    udp,
+)
+from pilotfish.core.dissect import ProtocolTree, Session, dissect
 from pilotfish.core.packet import Packet
 from pilotfish.core.protocols.checksum import ChecksumStatus
 
@@ -25,8 +37,11 @@ CLIENT = "02:00:00:00:00:02"
 SERVER = "02:00:00:00:00:01"
 
 
-def decode(data: bytes, link_type: int = ETHERNET) -> ProtocolTree:
-    return dissect(Packet(0, len(data), link_type, data), number=1)
+def decode(data: bytes, link_type: int = ETHERNET, *, original: int | None = None) -> ProtocolTree:
+    """Decode one packet. ``original`` says how long the frame was on the wire,
+    for a capture that a snapshot length cut short."""
+    length = len(data) if original is None else original
+    return dissect(Packet(0, length, link_type, data), number=1)
 
 
 class TestEthernet:
@@ -176,9 +191,19 @@ class TestIPv4:
 
     def test_a_payload_the_capture_cut_short(self) -> None:
         whole = ethernet(ipv4(icmp_echo(payload=b"x" * 40), protocol=1))
-        tree = decode(whole[:40])
+        tree = decode(whole[:40], original=len(whole))
         # The checksum covers bytes that weren't captured, so it isn't checked.
         assert tree.get("icmp.checksum.status") == ChecksumStatus.UNVERIFIED
+
+    def test_a_length_longer_than_the_frame_is_the_frame_s_word(self) -> None:
+        # A sender that claimed more than it sent, rather than a capture that
+        # cut a frame short: what is there is all there ever was, so the
+        # checksum over it still means something. Wireshark reads it that way.
+        whole = bytearray(ethernet(ipv4(icmp_echo(payload=b"x" * 8), protocol=1)))
+        whole[16:18] = (600).to_bytes(2, "big")  # ip.len, far past the frame
+        tree = decode(bytes(whole))
+        assert tree.get("ip.len") == 600
+        assert tree.get("icmp.checksum.status") == ChecksumStatus.GOOD
 
 
 class TestIPv6:
@@ -220,13 +245,18 @@ class TestIcmp:
         assert tree.info == "Echo (ping) request  id=0x1234, seq=7"
 
     def test_an_error_quotes_the_packet_that_caused_it(self) -> None:
-        original = ipv4(udp(50000, 53), protocol=17)
+        datagram = udp(50000, 53, source="192.0.2.1", destination="192.0.2.2")
+        original = ipv4(datagram, protocol=17)
         message = icmp(3, 3, bytes(4) + original[:28])
         tree = decode(ethernet(ipv4(message, protocol=1)))
         assert tree.info == "Destination unreachable (Port unreachable)"
         # The quoted packet is decoded, but doesn't take over the summary.
-        assert tree.protocols[3:] == ("icmp", "ip", "data")
+        assert tree.protocols[3:] == ("icmp", "ip", "udp")
         assert tree.values("ip.src") == [IPv4Address("192.0.2.1")] * 2
+        assert tree.get("udp.dstport") == 53
+        # An error quotes only the front of what caused it, so the checksum
+        # has nothing to add up over.
+        assert tree.get("udp.checksum.status") == ChecksumStatus.UNVERIFIED
         assert tree.protocol == "icmp"
 
     def test_a_message_checksum_that_does_not_add_up(self) -> None:
@@ -281,5 +311,302 @@ class TestIcmpv6:
         original = ipv6(udp(50000, 53), next_header=17)
         tree = self.message(1, 4, bytes(4) + original)
         assert tree.info == "Destination Unreachable (Port unreachable)"
-        assert tree.protocols[3:] == ("icmpv6", "ipv6", "data")
+        # This error quoted the whole datagram, so what it carried is there too.
+        assert tree.protocols[3:] == ("icmpv6", "ipv6", "udp", "data")
         assert tree.protocol == "icmpv6"
+
+
+CLIENT_ADDRESS = "192.0.2.1"
+SERVER_ADDRESS = "192.0.2.2"
+CLIENT_PORT = 50000
+SERVER_PORT = 80
+
+SYN = 0x002
+ACK = 0x010
+PUSH = 0x008
+
+
+class Transport:
+    """Builds the frames of one conversation, either way round.
+
+    A transport checksum covers the addresses as well, and the analysis only
+    makes sense if both directions are the same conversation, so which way a
+    packet is going has to reach the builders.
+    """
+
+    protocol: int
+
+    def build(self, ports: tuple[int, int], addresses: tuple[str, str], **rest: Any) -> bytes:
+        raise NotImplementedError
+
+    def frame(self, *, from_client: bool = True, **rest: Any) -> bytes:
+        ports = (CLIENT_PORT, SERVER_PORT) if from_client else (SERVER_PORT, CLIENT_PORT)
+        addresses = (
+            (CLIENT_ADDRESS, SERVER_ADDRESS) if from_client else (SERVER_ADDRESS, CLIENT_ADDRESS)
+        )
+        source, destination = addresses
+        segment = self.build(ports, addresses, **rest)
+        return ethernet(
+            ipv4(segment, self.protocol, source=source, destination=destination),
+            source=CLIENT if from_client else SERVER,
+            destination=SERVER if from_client else CLIENT,
+        )
+
+    def conversation(self, *frames: bytes) -> list[ProtocolTree]:
+        """Decode frames of one conversation, which have to share a session.
+
+        They are one second apart, as the frame builder stamps them.
+        """
+        session = Session()
+        return [
+            dissect(
+                Packet(number * 1_000_000_000, len(data), ETHERNET, data), number, session=session
+            )
+            for number, data in enumerate(frames, start=1)
+        ]
+
+
+class TestUdp(Transport):
+    protocol = 17
+
+    def build(self, ports: tuple[int, int], addresses: tuple[str, str], **rest: Any) -> bytes:
+        source, destination = addresses
+        return udp(*ports, source=source, destination=destination, **rest)
+
+    def test_the_header_and_what_it_says_about_itself(self) -> None:
+        tree = decode(ethernet(ipv4(udp(CLIENT_PORT, 53, b"query"))))
+        assert tree.get("udp.srcport") == CLIENT_PORT
+        assert tree.get("udp.dstport") == 53
+        assert tree.get("udp.length") == 13
+        assert tree.get("udp.payload") == b"query"
+        assert tree.info == "50000 → 53 Len=5"
+        assert tree.layers[3].summary == "User Datagram Protocol, Src Port: 50000, Dst Port: 53"
+
+    def test_a_datagram_with_no_checksum_is_not_a_damaged_one(self) -> None:
+        # Over IPv4 a sender may leave the checksum out, and says so with zero.
+        tree = decode(ethernet(ipv4(udp(CLIENT_PORT, 53))))
+        assert tree.get("udp.checksum") == 0
+        assert tree.get("udp.checksum.status") == ChecksumStatus.NOT_PRESENT
+
+    def test_a_checksum_taken_over_the_pseudo_header(self) -> None:
+        tree = decode(self.frame())
+        assert tree.get("udp.checksum.status") == ChecksumStatus.GOOD
+
+    def test_a_checksum_that_does_not_add_up(self) -> None:
+        tree = decode(self.frame(break_checksum=True))
+        assert tree.get("udp.checksum.status") == ChecksumStatus.BAD
+
+    def test_over_ipv6_the_checksum_covers_the_addresses_it_travelled_between(self) -> None:
+        datagram = udp(CLIENT_PORT, 53, source="2001:db8::1", destination="2001:db8::2")
+        tree = decode(ethernet(ipv6(datagram), ethertype=0x86DD))
+        assert tree.get("udp.checksum.status") == ChecksumStatus.GOOD
+
+    def test_a_checksum_the_hardware_had_not_finished(self) -> None:
+        # See the same case in TestTcp: the sum of the pseudo header on its own
+        # is what checksum offloading leaves behind.
+        half_done = bytearray(udp(CLIENT_PORT, 53))
+        pseudo = pseudo_header(CLIENT_ADDRESS, SERVER_ADDRESS, 17, len(half_done))
+        half_done[6:8] = (~checksum(pseudo) & 0xFFFF).to_bytes(2, "big")
+        tree = decode(ethernet(ipv4(bytes(half_done))))
+        assert tree.get("udp.checksum.status") == ChecksumStatus.GOOD
+
+    def test_a_length_shorter_than_the_header_itself(self) -> None:
+        broken = bytearray(udp(CLIENT_PORT, 53))
+        broken[4:6] = (4).to_bytes(2, "big")
+        tree = decode(ethernet(ipv4(bytes(broken))))
+        assert tree.error == "udp: a length of 4 is shorter than UDP's header"
+
+    def test_both_directions_are_one_stream(self) -> None:
+        trees = self.conversation(
+            self.frame(),
+            self.frame(from_client=False),
+            ethernet(ipv4(udp(50001, SERVER_PORT))),
+        )
+        assert [tree.get("udp.stream") for tree in trees] == [0, 0, 1]
+
+    def test_a_port_nothing_is_registered_for_is_left_as_data(self) -> None:
+        tree = decode(ethernet(ipv4(udp(CLIENT_PORT, 50001, b"whatever"))))
+        assert tree.protocols == ("frame", "eth", "ip", "udp", "data")
+        assert tree.get("data.data") == b"whatever"
+
+
+def option(kind: int, *body: int) -> bytes:
+    """One TCP option: its kind, its own length, and its body."""
+    return bytes([kind, len(body) + 2, *body])
+
+
+NOP = bytes([1])
+END = bytes([0])
+
+
+class TestTcp(Transport):
+    protocol = 6
+
+    def build(self, ports: tuple[int, int], addresses: tuple[str, str], **rest: Any) -> bytes:
+        source, destination = addresses
+        return tcp(*ports, source=source, destination=destination, **rest)
+
+    def handshake(self, **rest: Any) -> list[bytes]:
+        """The three frames that open a connection, at sequence 100 and 500."""
+        return [
+            self.frame(seq=100, flags=SYN, **rest),
+            self.frame(seq=500, ack=101, flags=SYN | ACK, from_client=False, **rest),
+            self.frame(seq=101, ack=501, flags=ACK),
+        ]
+
+    def test_the_header(self) -> None:
+        tree = decode(self.frame(payload=b"hello", seq=1, flags=PUSH | ACK))
+        assert tree.get("tcp.srcport") == CLIENT_PORT
+        assert tree.get("tcp.dstport") == SERVER_PORT
+        assert tree.get("tcp.hdr_len") == 20
+        assert tree.get("tcp.len") == 5
+        assert tree.get("tcp.window_size_value") == 8192
+        assert tree.get("tcp.payload") == b"hello"
+        assert tree.layers[3].summary == (
+            "Transmission Control Protocol, Src Port: 50000, Dst Port: 80, Seq: 1, Ack: 1, Len: 5"
+        )
+
+    def test_the_flags_are_spelled_out_two_ways(self) -> None:
+        tree = decode(self.frame(seq=0, flags=SYN | ACK))
+        assert tree.get("tcp.flags.syn") is True
+        assert tree.get("tcp.flags.ack") is True
+        assert tree.get("tcp.flags.fin") is False
+        assert tree.get("tcp.flags.str") == "·······A··S·"
+        assert tree.info == "50000 → 80 [SYN, ACK] Seq=0 Ack=1 Win=8192 Len=0"
+
+    def test_a_header_shorter_than_it_could_be(self) -> None:
+        broken = bytearray(tcp(CLIENT_PORT, SERVER_PORT))
+        broken[12] = 0x40  # four words of header, where five is the least
+        tree = decode(ethernet(ipv4(bytes(broken), 6)))
+        assert tree.error == "tcp: a header of 16 bytes is shorter than TCP's 20"
+
+    def test_sequence_numbers_count_from_the_handshake(self) -> None:
+        # Where a connection's numbers start is its own business, so Wireshark
+        # counts from there, and so does pilotfish.
+        trees = self.conversation(
+            *self.handshake(),
+            self.frame(payload=b"hi", seq=101, ack=501, flags=PUSH | ACK),
+        )
+        assert [tree.get("tcp.seq") for tree in trees] == [0, 0, 1, 1]
+        assert [tree.get("tcp.ack") for tree in trees] == [None, 1, 1, 1]
+        assert trees[0].get("tcp.seq_raw") == 100
+        assert trees[3].get("tcp.nxtseq") == 3
+
+    def test_a_connection_joined_halfway_counts_from_the_first_segment(self) -> None:
+        # With no handshake to count from, Wireshark makes the first segment it
+        # sees sequence 1, so the numbers still start somewhere near zero.
+        trees = self.conversation(
+            self.frame(payload=b"hi", seq=4_000_000, ack=9_000_000, flags=PUSH | ACK),
+            self.frame(seq=9_000_000, ack=4_000_002, flags=ACK, from_client=False),
+        )
+        assert (trees[0].get("tcp.seq"), trees[0].get("tcp.ack")) == (1, 1)
+        assert (trees[1].get("tcp.seq"), trees[1].get("tcp.ack")) == (1, 3)
+        # Nothing said what the scaling is, and Wireshark says so with -1.
+        assert trees[0].get("tcp.window_size_scalefactor") == -1
+
+    def test_the_options_a_handshake_agrees_on(self) -> None:
+        options = option(2, 0x05, 0xB4) + option(3, 7) + NOP + option(4) + NOP + NOP
+        tree = decode(self.frame(seq=100, flags=SYN, options=options))
+        assert tree.get("tcp.hdr_len") == 32
+        assert tree.get("tcp.options.mss_val") == 1460
+        assert tree.get("tcp.options.wscale.shift") == 7
+        assert tree.get("tcp.options.wscale.multiplier") == 128
+        assert tree.get("tcp.options.sack_perm") == bytes([4, 2])
+        assert tree.values("tcp.option_kind") == [2, 3, 1, 4, 1, 1]
+        assert tree.get("tcp.len") == 0
+
+    def test_the_padding_after_the_end_of_the_option_list_is_not_payload(self) -> None:
+        # Wireshark counts every padding byte as another end-of-list option.
+        options = option(2, 0x05, 0xB4) + END * 4
+        tree = decode(self.frame(payload=b"hi", seq=1, flags=PUSH | ACK, options=options))
+        assert tree.values("tcp.options.eol") == [END] * 4
+        assert tree.get("tcp.len") == 2
+        assert tree.get("tcp.payload") == b"hi"
+
+    def test_an_option_that_claims_no_length(self) -> None:
+        tree = decode(self.frame(seq=100, flags=SYN, options=bytes([2, 1, 0, 0])))
+        assert tree.error == "tcp: option 2 claims a length of 1"
+
+    def test_selective_acknowledgement_names_what_arrived(self) -> None:
+        # The edges are sequence numbers of the other direction, so they count
+        # from where that direction started.
+        blocks = (201).to_bytes(4, "big") + (301).to_bytes(4, "big")
+        options = bytes([5, 10]) + blocks + NOP + NOP
+        trees = self.conversation(
+            *self.handshake(),
+            self.frame(seq=501, ack=101, flags=ACK, options=options, from_client=False),
+        )
+        assert trees[3].get("tcp.options.sack.count") == 1
+        assert trees[3].get("tcp.options.sack_le") == 101
+        assert trees[3].get("tcp.options.sack_re") == 201
+
+    def test_timestamps(self) -> None:
+        options = option(8, 0x00, 0x00, 0x30, 0x39, 0x00, 0x00, 0x00, 0x2A) + NOP + NOP
+        tree = decode(self.frame(seq=1, flags=ACK, options=options))
+        assert tree.get("tcp.options.timestamp.tsval") == 12345
+        assert tree.get("tcp.options.timestamp.tsecr") == 42
+
+    def test_the_window_is_scaled_once_the_handshake_has_agreed_a_shift(self) -> None:
+        trees = self.conversation(*self.handshake(window=1000, options=option(3, 7) + NOP))
+        # The handshake itself means what it says; after it the shift applies.
+        assert trees[0].get("tcp.window_size") == 1000
+        assert trees[0].get("tcp.window_size_scalefactor") is None
+        assert trees[2].get("tcp.window_size_value") == 8192
+        assert trees[2].get("tcp.window_size") == 8192 * 128
+        assert trees[2].get("tcp.window_size_scalefactor") == 128
+
+    def test_a_handshake_that_never_asked_for_scaling(self) -> None:
+        # Wireshark tells "nobody asked" (-2) from "I never saw them ask" (-1).
+        trees = self.conversation(*self.handshake())
+        assert trees[2].get("tcp.window_size_scalefactor") == -2
+        assert trees[2].get("tcp.window_size") == 8192
+
+    def test_a_checksum_over_the_pseudo_header(self) -> None:
+        tree = decode(self.frame(payload=b"hello", seq=1, flags=PUSH | ACK))
+        assert tree.get("tcp.checksum.status") == ChecksumStatus.GOOD
+
+    def test_a_checksum_that_does_not_add_up(self) -> None:
+        tree = decode(self.frame(payload=b"hello", seq=1, break_checksum=True))
+        assert tree.get("tcp.checksum.status") == ChecksumStatus.BAD
+
+    def test_a_checksum_the_hardware_had_not_finished(self) -> None:
+        # A packet captured on its way out can carry the sum of the pseudo
+        # header alone, which the card would have finished. Wireshark reads
+        # that as checksum offloading rather than as damage.
+        half_done = bytearray(tcp(CLIENT_PORT, SERVER_PORT, b"hello", seq=1, flags=PUSH | ACK))
+        pseudo = pseudo_header(CLIENT_ADDRESS, SERVER_ADDRESS, 6, len(half_done))
+        half_done[16:18] = (~checksum(pseudo) & 0xFFFF).to_bytes(2, "big")
+        tree = decode(ethernet(ipv4(bytes(half_done), 6)))
+        assert tree.get("tcp.checksum.status") == ChecksumStatus.GOOD
+
+    def test_a_gap_in_the_sequence_numbers_means_something_was_missed(self) -> None:
+        trees = self.conversation(
+            self.frame(payload=b"a" * 100, seq=1, flags=PUSH | ACK),
+            self.frame(payload=b"c" * 100, seq=301, flags=PUSH | ACK),
+        )
+        assert "tcp.analysis.lost_segment" not in trees[0]
+        assert trees[1].get("tcp.analysis.lost_segment") is True
+
+    def test_an_acknowledgement_that_says_nothing_new_is_a_duplicate(self) -> None:
+        answer = self.frame(seq=1, ack=101, flags=ACK, from_client=False)
+        trees = self.conversation(
+            self.frame(payload=b"a" * 100, seq=1, flags=PUSH | ACK), answer, answer, answer
+        )
+        assert "tcp.analysis.duplicate_ack" not in trees[1]
+        assert [tree.get("tcp.analysis.duplicate_ack_num") for tree in trees[2:]] == [1, 2]
+        # They point back at the acknowledgement they are repeating.
+        assert trees[3].get("tcp.analysis.duplicate_ack_frame") == 2
+
+    def test_what_a_segment_acknowledges_and_how_long_it_took(self) -> None:
+        trees = self.conversation(
+            self.frame(payload=b"a" * 100, seq=1, flags=PUSH | ACK),
+            self.frame(seq=1, ack=101, flags=ACK, from_client=False),
+        )
+        assert trees[1].get("tcp.analysis.acks_frame") == 1
+        # The frames are a second apart.
+        assert trees[1].get("tcp.analysis.ack_rtt") == 1_000_000_000
+
+    def test_a_payload_no_port_claims_is_left_as_data(self) -> None:
+        tree = decode(self.frame(payload=b"whatever", seq=1, flags=PUSH | ACK))
+        assert tree.protocols == ("frame", "eth", "ip", "tcp", "data")
+        assert tree.get("data.data") == b"whatever"

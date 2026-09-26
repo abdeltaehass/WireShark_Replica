@@ -1,13 +1,14 @@
 """Dissectors, and the tables that decide which one decodes what."""
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from ipaddress import IPv4Address, IPv6Address
 from typing import ClassVar
 
 from pilotfish.core.dissect.buffer import Buffer
 from pilotfish.core.dissect.fields import Field, FieldRegistry, FieldType
 from pilotfish.core.dissect.reader import Reader
+from pilotfish.core.dissect.session import Session
 from pilotfish.core.packet import Packet
 
 LINK_TYPE = "linktype"
@@ -19,12 +20,19 @@ class Handoff:
     """The bytes a dissector didn't decode, and where to look up what will.
 
     ``key`` is the value the header gave for what comes next: an EtherType,
-    an IP protocol number, a port.
+    an IP protocol number, a port. A dissector that worked out what follows
+    some other way, as a heuristic does, names it in ``dissector`` instead.
     """
 
     table: str
     key: int
     payload: Buffer
+    also: tuple[int, ...] = ()
+    """More values to try when the first doesn't match, as a transport
+    protocol tries both of its ports."""
+    heuristics: str = ""
+    """The list of dissectors to ask when no value matched at all."""
+    dissector: "Dissector | None" = None
 
 
 @dataclass(slots=True)
@@ -34,6 +42,8 @@ class Context:
     packet: Packet
     number: int = 1
     """Where the packet came in the capture."""
+    session: Session = field(default_factory=Session)
+    """What the capture has seen so far, for dissectors that track connections."""
     info: str = ""
     """The one-line summary. The innermost dissector that sets it wins."""
     source: IPv4Address | IPv6Address | None = None
@@ -81,6 +91,15 @@ class Dissector:
     def dissect(self, reader: Reader, context: Context) -> Handoff | None:
         raise NotImplementedError
 
+    def looks_like(self, payload: Buffer, context: Context) -> bool:
+        """Whether this dissector recognises a payload nothing else claimed.
+
+        A heuristic dissector answers this by looking at the first bytes. The
+        transport protocols ask every heuristic registered with them when no
+        port matches.
+        """
+        return False
+
     @property
     def protocol(self) -> Field:
         """The field that stands for the layer itself."""
@@ -99,6 +118,7 @@ class Registry:
     def __init__(self, fields: FieldRegistry | None = None) -> None:
         self.fields = fields if fields is not None else FieldRegistry()
         self._tables: dict[str, dict[int, Dissector]] = {}
+        self._heuristics: dict[str, list[Dissector]] = {}
         self._dissectors: dict[type[Dissector], Dissector] = {}
 
     def add(
@@ -125,6 +145,24 @@ class Registry:
     def find(self, table: str, key: int) -> Dissector | None:
         """The dissector registered for ``key``, if there is one."""
         return self._tables.get(table, {}).get(key)
+
+    def add_heuristic(self, dissector: type[Dissector], under: str) -> Dissector:
+        """Register a dissector to be asked about payloads no port claimed."""
+        instance = self.add(dissector)
+        heuristics = self._heuristics.setdefault(under, [])
+        if instance not in heuristics:
+            heuristics.append(instance)
+        return instance
+
+    def heuristics(self, under: str) -> tuple[Dissector, ...]:
+        """The dissectors to ask, in the order they were registered."""
+        return tuple(self._heuristics.get(under, ()))
+
+    def guess(self, under: str, payload: Buffer, context: Context) -> Dissector | None:
+        """The first heuristic dissector that recognises ``payload``."""
+        return next(
+            (each for each in self.heuristics(under) if each.looks_like(payload, context)), None
+        )
 
     def table(self, name: str) -> Mapping[int, Dissector]:
         """One routing table, for showing what a build can decode."""

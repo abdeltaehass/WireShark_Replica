@@ -9,8 +9,9 @@ from pathlib import Path
 
 import pytest
 
+import pilotfish.core.protocols  # noqa: F401  (registers the dissectors)
 import tshark
-from pilotfish.core.dissect import dissect
+from pilotfish.core.dissect import REGISTRY, FieldType, Session, dissect
 from pilotfish.core.formats import CaptureFile
 
 CAPTURES = tshark.captures_with_keys()
@@ -83,11 +84,57 @@ SKIPPED = ("frame.len", "frame.cap_len", "data.data", "data.len")
 @pytest.mark.parametrize("capture", CAPTURES, ids=sample_id)
 def test_every_field_matches_tshark(capture: Path) -> None:
     expected = tshark.packets(capture)
+    session = Session()
     with CaptureFile(capture) as file:
         for number, (packet, fields) in enumerate(zip(file, expected, strict=True), start=1):
-            tree = dissect(packet, number)
+            tree = dissect(packet, number, session=session)
             assert tree.error is None, f"packet {number} of {capture.name}"
             tshark.compare(tree, fields, skip=SKIPPED)
+
+
+# What a TCP connection's history says about a segment, rather than what the
+# segment says about itself.
+ANALYSIS_FLAGS = tuple(
+    field.name
+    for field in REGISTRY.fields
+    if field.name.startswith("tcp.analysis.") and field.type is FieldType.BOOL
+)
+
+
+def analysis_flags(fields: tshark.Fields | object) -> set[str]:
+    return {name for name in ANALYSIS_FLAGS if name in fields}  # type: ignore[operator]
+
+
+def test_the_samples_raise_every_analysis_flag() -> None:
+    """The comparison below is only worth having if the samples exercise it."""
+    raised = {
+        name
+        for capture in CAPTURES
+        for fields in tshark.packets(capture)
+        for name in analysis_flags(fields)
+    }
+    assert raised == set(ANALYSIS_FLAGS)
+
+
+@pytest.mark.parametrize("capture", CAPTURES, ids=sample_id)
+def test_the_tcp_analysis_matches_tshark(capture: Path) -> None:
+    """Every judgement about a TCP connection agrees with Wireshark's.
+
+    These aren't read out of a packet: they come from what the connection has
+    done so far, so a flag pilotfish failed to raise matters as much as one it
+    raised wrongly. The comparison above only sees the fields pilotfish
+    decoded, so here the whole set is compared, packet for packet.
+    """
+    expected = tshark.packets(capture)
+    session = Session()
+    with CaptureFile(capture) as file:
+        for number, (packet, fields) in enumerate(zip(file, expected, strict=True), start=1):
+            tree = dissect(packet, number, session=session)
+            where = f"packet {number} of {capture.name}"
+            assert analysis_flags(tree) == analysis_flags(fields), where
+            for name in ("tcp.analysis.duplicate_ack_num", "tcp.analysis.duplicate_ack_frame"):
+                theirs = fields.get(name)
+                assert tree.get(name) == (int(theirs[0]) if theirs else None), f"{name}, {where}"
 
 
 @pytest.mark.parametrize("capture", CAPTURES, ids=sample_id)
@@ -98,6 +145,7 @@ def test_the_layers_match_tshark_as_far_as_they_go(capture: Path) -> None:
     found has to be the start of what tshark found rather than all of it.
     """
     expected = tshark.packets(capture)
+    session = Session()
     with CaptureFile(capture) as file:
         for number, (packet, fields) in enumerate(zip(file, expected, strict=True), start=1):
             theirs = [
@@ -106,5 +154,6 @@ def test_the_layers_match_tshark_as_far_as_they_go(capture: Path) -> None:
                 # A pseudo-layer for the value that chose the next protocol.
                 if name not in {"ethertype", "data"}
             ]
-            ours = [name for name in dissect(packet, number).protocols if name != "data"][1:]
+            decoded = dissect(packet, number, session=session)
+            ours = [name for name in decoded.protocols if name != "data"][1:]
             assert ours == theirs[: len(ours)], f"packet {number} of {capture.name}"

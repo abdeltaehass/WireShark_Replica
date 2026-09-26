@@ -10,12 +10,14 @@ Reference: the IANA protocol numbers registry.
 
 from pilotfish.core.dissect import (
     LINK_TYPE,
+    Buffer,
     Context,
     Dissector,
     Handoff,
     Reader,
     register,
 )
+from pilotfish.core.packet import Packet
 
 IP_PROTO = "ip.proto"
 """The table keyed by protocol number, for what an IP packet carries."""
@@ -29,11 +31,15 @@ PROTO_UDP = 17
 PROTO_ICMPV6 = 58
 
 LINKTYPE_RAW = 101
+LINKTYPE_RAW_BSD = 12
+"""What BSD numbered a raw IP link, which files captured on a Mac still carry.
+libpcap writes 101 now, but tcpdump's registry keeps both."""
+LINKTYPE_RAW_OPENBSD = 14
 LINKTYPE_IPV4 = 228
 LINKTYPE_IPV6 = 229
 
 
-@register(LINK_TYPE, LINKTYPE_RAW)
+@register(LINK_TYPE, LINKTYPE_RAW, LINKTYPE_RAW_BSD, LINKTYPE_RAW_OPENBSD)
 class Raw(Dissector):
     """A link that carries a bare IP packet, with no header of its own.
 
@@ -47,3 +53,14 @@ class Raw(Dissector):
     def dissect(self, reader: Reader, context: Context) -> Handoff:
         version = reader.buffer.peek(1, "ip.version")[0] >> 4
         return Handoff(IP_VERSION, version, reader.payload())
+
+
+def cut_short(payload: Buffer, declared: int, packet: Packet) -> bool:
+    """Whether the capture holds less of a payload than the header says.
+
+    A header claiming more than the frame is long is taken at the frame's
+    word, as Wireshark takes it: the bytes that are there are all there ever
+    were, so a checksum over them can still be checked. It is a snapshot
+    length cutting a frame short that leaves bytes nobody can see.
+    """
+    return payload.remaining < min(declared, packet.original_length - payload.offset)

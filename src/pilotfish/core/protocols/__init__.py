@@ -17,6 +17,8 @@ from pilotfish.core.protocols import (
     ipv4,
     ipv6,
     loopback,
+    tcp,
+    udp,
 )
 
 __all__ = [
@@ -28,4 +30,6 @@ __all__ = [
     "ipv4",
     "ipv6",
     "loopback",
+    "tcp",
+    "udp",
 ]

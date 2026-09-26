@@ -9,7 +9,7 @@ import pilotfish.core.protocols  # noqa: F401  (registers the dissectors)
 from pilotfish.cli.detail import write_tree
 from pilotfish.cli.table import PacketTable, TimeFormat
 from pilotfish.core.capture import MAX_SNAPLEN, compile_filter
-from pilotfish.core.dissect import dissect
+from pilotfish.core.dissect import Session, dissect
 from pilotfish.core.filters import FilterError, Program, machine
 from pilotfish.core.formats import CaptureFile, CaptureFileError
 from pilotfish.core.linktypes import dlt_from_link_type
@@ -37,6 +37,9 @@ def run(
         return _fail(path, error)
 
     table = PacketTable(out, time_format)
+    # One session for the whole file, so a dissector that follows connections
+    # sees the packets before this one.
+    session = Session()
     # A pcapng file can hold interfaces with different link types, and a
     # filter has to be compiled for each of them.
     programs: dict[int, Program] = {}
@@ -57,7 +60,7 @@ def run(
                 if filter_text is not None and not _matches(packet, filter_text, programs):
                     continue
                 shown += 1
-                decoded = dissect(packet, number)
+                decoded = dissect(packet, number, session=session)
                 if not tree:
                     table.write_row(number, packet, decoded)
                     continue

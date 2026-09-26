@@ -168,7 +168,9 @@ class Icmpv6(Dissector):
 
     @staticmethod
     def _status(context: Context, message: bytes) -> ChecksumStatus:
-        if context.truncated or context.source is None or context.destination is None:
+        if context.truncated or context.in_error:
+            return ChecksumStatus.UNVERIFIED
+        if context.source is None or context.destination is None:
             return ChecksumStatus.UNVERIFIED
         pseudo = pseudo_header(context.source, context.destination, PROTO_ICMPV6, len(message))
         return verify(pseudo, message)

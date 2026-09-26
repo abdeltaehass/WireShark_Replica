@@ -187,14 +187,215 @@ def link_layer_option(kind: int, address: str) -> bytes:
     return struct.pack(">BB", kind, 1) + mac(address)
 
 
-def write_pcap(path: Path, link_type: int, packets: list[bytes]) -> None:
-    """A pcap file with microsecond timestamps, one second apart."""
+def write_pcap(
+    path: Path, link_type: int, packets: list[bytes], times: list[float] | None = None
+) -> None:
+    """A pcap file, one packet a second unless ``times`` says otherwise."""
     out = bytearray(struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 262144, link_type))
     for number, packet in enumerate(packets):
-        out += struct.pack("<IIII", 1_700_000_000 + number, 0, len(packet), len(packet))
+        when = float(number) if times is None else times[number]
+        seconds, microseconds = divmod(round(when * 1_000_000), 1_000_000)
+        out += struct.pack("<IIII", 1_700_000_000 + seconds, microseconds, len(packet), len(packet))
         out += packet
     path.write_bytes(out)
     print(f"wrote {path.relative_to(SAMPLES_DIR.parent.parent)} ({len(packets)} packets)")
+
+
+CLIENT_PORT = 50000
+SERVER_PORT = 80
+CLIENT_ISN = 1000
+SERVER_ISN = 5000
+
+FIN = 0x01
+SYN = 0x02
+ACK = 0x10
+PUSH = 0x08
+
+
+def tcp(
+    sequence: int,
+    acknowledgement: int,
+    flags: int,
+    *,
+    payload: bytes = b"",
+    window: int = 8000,
+    options: bytes = b"",
+    from_client: bool = True,
+    client_port: int = CLIENT_PORT,
+) -> bytes:
+    """One TCP segment, checksummed over the IPv4 pseudo header."""
+    assert len(options) % 4 == 0
+    header = struct.pack(
+        ">HHIIBBHHH",
+        client_port if from_client else SERVER_PORT,
+        SERVER_PORT if from_client else client_port,
+        sequence,
+        acknowledgement,
+        (5 + len(options) // 4) << 4,
+        flags,
+        window,
+        0,
+        0,
+    )
+    source, destination = ("192.0.2.1", "192.0.2.2") if from_client else ("192.0.2.2", "192.0.2.1")
+    segment = header + options + payload
+    pseudo = (
+        IPv4Address(source).packed
+        + IPv4Address(destination).packed
+        + struct.pack(">BBH", 0, PROTO_TCP, len(segment))
+    )
+    value = checksum(pseudo + segment)
+    segment = segment[:16] + struct.pack(">H", value) + segment[18:]
+    return ethernet(
+        ipv4(segment, PROTO_TCP, source=source, destination=destination),
+        ETHERTYPE_IPV4,
+        source=CLIENT_MAC if from_client else SERVER_MAC,
+        destination=SERVER_MAC if from_client else CLIENT_MAC,
+    )
+
+
+def tcp_capture() -> tuple[list[bytes], list[float]]:
+    """A connection carrying every judgement the analysis can make.
+
+    The times matter as much as the sequence numbers: re-ordering is only
+    re-ordering if it arrives soon after the segment it follows, and a
+    retransmission is only fast if it comes hard on the heels of duplicate
+    acknowledgements.
+    """
+    # Twelve bytes of options: a maximum segment size, a window scale of zero
+    # so the windows below mean what they say, and selective acknowledgement.
+    handshake = (
+        struct.pack(">BBH", 2, 4, 1460)
+        + struct.pack(">BBB", 3, 3, 0)
+        + bytes([1])
+        + struct.pack(">BB", 4, 2)
+        + bytes(2)
+    )
+    client = CLIENT_ISN
+    server = SERVER_ISN
+    packets = [
+        # The handshake, which fixes where the sequence numbers start.
+        tcp(client, 0, SYN, options=handshake),
+        tcp(server, client + 1, SYN | ACK, options=handshake, from_client=False),
+        tcp(client + 1, server + 1, ACK),
+        # A hundred bytes, then a gap, then the pieces that fill it.
+        tcp(client + 1, server + 1, PUSH | ACK, payload=b"a" * 100),
+        tcp(client + 301, server + 1, PUSH | ACK, payload=b"d" * 100),
+        tcp(client + 101, server + 1, PUSH | ACK, payload=b"b" * 100),
+        tcp(client + 201, server + 1, PUSH | ACK, payload=b"c" * 100),
+        tcp(server + 1, client + 401, ACK, from_client=False),
+        tcp(client + 401, server + 1, PUSH | ACK, payload=b"e" * 100),
+        # Two acknowledgements that say nothing new, then the sender giving up
+        # on the segment they keep asking for.
+        tcp(server + 1, client + 401, ACK, from_client=False),
+        tcp(server + 1, client + 401, ACK, from_client=False),
+        tcp(client + 401, server + 1, PUSH | ACK, payload=b"e" * 100),
+        # Data the other end acknowledged long ago.
+        tcp(client + 1, server + 1, PUSH | ACK, payload=b"a" * 100),
+        # The window shuts, is probed, and opens again.
+        tcp(server + 1, client + 501, ACK, window=0, from_client=False),
+        tcp(client + 501, server + 1, PUSH | ACK, payload=b"f"),
+        tcp(server + 1, client + 501, ACK, window=0, from_client=False),
+        tcp(server + 1, client + 501, ACK, from_client=False),
+        # The byte the probe carried, now that there is room for it.
+        tcp(client + 501, server + 1, PUSH | ACK, payload=b"f"),
+        tcp(server + 1, client + 502, ACK, from_client=False),
+        # Filling the window right to its edge.
+        tcp(client + 502, server + 1, PUSH | ACK, payload=b"g" * 8000),
+        tcp(server + 1, client + 8502, ACK, from_client=False),
+        # A keep-alive starts one byte before what comes next, and is answered.
+        tcp(client + 8501, server + 1, ACK, payload=b"g"),
+        tcp(server + 1, client + 8502, ACK, from_client=False),
+        # Closing down.
+        tcp(client + 8502, server + 1, FIN | ACK),
+        tcp(server + 1, client + 8503, FIN | ACK, from_client=False),
+        tcp(client + 8503, server + 2, ACK),
+        # A second connection, for the two judgements the first one can't
+        # make: a segment that arrives late enough to be re-ordering rather
+        # than a resend, which takes the other end having acknowledged
+        # something in between, and an acknowledgement of data that was never
+        # captured.
+        *second_connection(),
+    ]
+    times = [
+        0.000,
+        0.010,
+        0.020,  # handshake, a 10 ms round trip
+        0.030,
+        0.040,
+        0.041,
+        0.045,  # data, a gap, and the pieces filling it
+        0.050,
+        0.060,
+        0.150,
+        0.160,
+        0.165,  # duplicate acknowledgements, then a fast resend
+        0.300,  # a resend of data already acknowledged
+        0.400,
+        0.500,
+        0.510,
+        0.600,  # window shut, probed, opened
+        0.700,
+        0.710,  # the byte the probe carried
+        0.800,
+        0.810,  # filling the window
+        0.900,
+        0.910,  # a keep-alive and its answer
+        1.000,
+        1.010,
+        1.020,  # closing down
+        2.000,
+        2.010,
+        2.020,  # the second connection's handshake
+        2.030,
+        2.040,
+        2.045,  # data, a gap, and the other end saying where it got to
+        2.050,  # the piece filling the gap, soon enough to be re-ordering
+        2.060,
+        2.070,  # acknowledgements of data that isn't in the capture
+    ]
+    assert len(times) == len(packets)
+    return packets, times
+
+
+SECOND_CLIENT_PORT = 50001
+SECOND_CLIENT_ISN = 2000
+SECOND_SERVER_ISN = 6000
+
+
+def second_connection() -> list[bytes]:
+    """A short connection whose gap is filled while the other end is talking.
+
+    Wireshark calls a late segment re-ordering rather than a resend when it
+    comes within the handshake's round trip of the other end's last
+    acknowledgement, so the acknowledgement in the middle is what makes the
+    difference here.
+    """
+    client = SECOND_CLIENT_ISN
+    server = SECOND_SERVER_ISN
+
+    def segment(sequence: int, acknowledgement: int, flags: int, **rest: object) -> bytes:
+        return tcp(
+            sequence,
+            acknowledgement,
+            flags,
+            client_port=SECOND_CLIENT_PORT,
+            **rest,  # type: ignore[arg-type]
+        )
+
+    return [
+        segment(client, 0, SYN),
+        segment(server, client + 1, SYN | ACK, from_client=False),
+        segment(client + 1, server + 1, ACK),
+        segment(client + 1, server + 1, PUSH | ACK, payload=b"a" * 100),
+        segment(client + 201, server + 1, PUSH | ACK, payload=b"c" * 100),
+        segment(server + 1, client + 101, ACK, from_client=False),
+        segment(client + 101, server + 1, PUSH | ACK, payload=b"b" * 100),
+        # Two acknowledgements that reach past anything the capture holds:
+        # the client's own segments only ever got as far as 301.
+        segment(server + 1, client + 401, ACK, from_client=False),
+        segment(server + 1, client + 501, ACK, from_client=False),
+    ]
 
 
 def vlan_capture() -> list[bytes]:
@@ -363,6 +564,8 @@ def main() -> None:
     write_pcap(SAMPLES_DIR / "icmpv6.pcap", LINKTYPE_ETHERNET, icmpv6_capture())
     write_pcap(SAMPLES_DIR / "ipv6-extensions.pcap", LINKTYPE_ETHERNET, extensions_capture())
     write_pcap(SAMPLES_DIR / "loopback.pcap", LINKTYPE_NULL, loopback_capture())
+    segments, times = tcp_capture()
+    write_pcap(SAMPLES_DIR / "tcp.pcap", LINKTYPE_ETHERNET, segments, times)
 
 
 if __name__ == "__main__":

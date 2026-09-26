@@ -274,3 +274,110 @@ def test_handoffs_carry_the_bytes_and_where_to_look_them_up() -> None:
     handoff = Handoff("ethertype", 0x0800, Buffer(b"\x45\x00"))
     assert (handoff.table, handoff.key) == ("ethertype", 0x0800)
     assert handoff.payload.remaining == 2
+
+
+PORTS = "ports"
+"""A table keyed by port, as the transport protocols' tables are."""
+
+
+class Transport(Dissector):
+    """Hands over what follows under both of its ports, lower one first.
+
+    This is the shape UDP and TCP hand a payload on with: a port each end,
+    either of which may be the one that says what the payload is, and a list
+    of dissectors to ask when neither does.
+    """
+
+    name = "transport"
+    title = "Transport"
+    fields = (Field("transport.port", FieldType.UINT, "Port"),)
+
+    def dissect(self, reader: Reader, context: Context) -> Handoff:
+        first = reader.uint16("transport.port")
+        second = reader.uint16("transport.port")
+        return Handoff(
+            PORTS,
+            min(first, second),
+            reader.payload(),
+            also=(max(first, second),),
+            heuristics=PORTS,
+        )
+
+
+class Known(Dissector):
+    """What a well-known port routes to."""
+
+    name = "known"
+    title = "Known"
+
+    def dissect(self, reader: Reader, context: Context) -> None:
+        context.info = "known"
+        reader.set_length(reader.remaining)
+        return None
+
+
+class Guessed(Dissector):
+    """A dissector that recognises its own payloads by how they start."""
+
+    name = "guessed"
+    title = "Guessed"
+
+    def looks_like(self, payload: Buffer, context: Context) -> bool:
+        return bytes(payload.peek(min(payload.remaining, 4))) == b"GUES"
+
+    def dissect(self, reader: Reader, context: Context) -> None:
+        context.info = "guessed"
+        reader.set_length(reader.remaining)
+        return None
+
+
+class TestRouting:
+    """How a handoff finds the dissector for what comes next."""
+
+    def registry(self, *, port: int | None = None, heuristic: bool = False) -> Registry:
+        registry = Registry()
+        registry.add(Transport, LINK_TYPE, (TOY_LINK_TYPE,))
+        if port is not None:
+            registry.add(Known, PORTS, (port,))
+        if heuristic:
+            registry.add_heuristic(Guessed, PORTS)
+        return registry
+
+    def decode(self, registry: Registry, ports: tuple[int, int], payload: bytes) -> ProtocolTree:
+        data = b"".join(port.to_bytes(2, "big") for port in ports) + payload
+        return dissect(packet(data), registry=registry)
+
+    def test_the_lower_port_is_tried_first(self) -> None:
+        tree = self.decode(self.registry(port=53), (50000, 53), b"body")
+        assert tree.protocols == ("frame", "transport", "known")
+
+    def test_the_other_port_is_tried_next(self) -> None:
+        # A server talking back has the well-known port at the other end.
+        tree = self.decode(self.registry(port=50000), (50000, 53), b"body")
+        assert tree.protocols == ("frame", "transport", "known")
+
+    def test_a_dissector_that_recognises_the_payload_gets_it(self) -> None:
+        tree = self.decode(self.registry(heuristic=True), (50000, 50001), b"GUESwhat")
+        assert tree.protocols == ("frame", "transport", "guessed")
+        assert tree.info == "guessed"
+
+    def test_a_port_that_matches_wins_over_a_heuristic(self) -> None:
+        registry = self.registry(port=53, heuristic=True)
+        tree = self.decode(registry, (50000, 53), b"GUESwhat")
+        assert tree.protocols == ("frame", "transport", "known")
+
+    def test_a_payload_nothing_recognises_is_data(self) -> None:
+        tree = self.decode(self.registry(heuristic=True), (50000, 50001), b"mystery")
+        assert tree.protocols == ("frame", "transport", "data")
+
+    def test_the_heuristics_are_asked_in_the_order_they_registered(self) -> None:
+        registry = self.registry(heuristic=True)
+        registry.add_heuristic(Known, PORTS)
+        assert [each.name for each in registry.heuristics(PORTS)] == ["guessed", "known"]
+        # Registering the same one again doesn't ask it twice.
+        registry.add_heuristic(Guessed, PORTS)
+        assert len(registry.heuristics(PORTS)) == 2
+
+    def test_a_table_with_no_heuristics_has_nothing_to_ask(self) -> None:
+        assert self.registry().heuristics(PORTS) == ()
+        assert self.registry().guess(PORTS, Buffer(b"GUES"), Context(packet=packet(b""))) is None

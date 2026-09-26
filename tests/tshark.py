@@ -61,15 +61,35 @@ def packets(capture: Path) -> tuple[Fields, ...]:
         recorded = run_tshark(capture)
     else:
         pytest.skip(f"{key.name} hasn't been recorded and tshark isn't installed")
-    return tuple(fields_of(entry) for entry in json.loads(recorded))
+    return tuple(fields_of(entry) for entry in json.loads(recorded, object_pairs_hook=_merge))
+
+
+def _merge(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Keep every value of a repeated field.
+
+    tshark writes a field that appears more than once in a packet as repeated
+    keys of the same JSON object, which a plain parse would collapse to the
+    last one, losing every option but the last of its kind.
+    """
+    merged: dict[str, Any] = {}
+    for key, value in pairs:
+        if key not in merged:
+            merged[key] = value
+        elif isinstance(merged[key], list):
+            merged[key].append(value)
+        else:
+            merged[key] = [merged[key], value]
+    return merged
 
 
 def run_tshark(capture: Path) -> str:
     result = subprocess.run(
         # The same preferences scripts/update_answer_keys.py records with.
         [
-            *["tshark", "-n", "-r", capture.name, "-Y", TSHARK_FILTER],
-            *["-T", "json", "-o", "ip.check_checksum:TRUE"],
+            *["tshark", "-n", "-r", capture.name, "-Y", TSHARK_FILTER, "-T", "json"],
+            *["-o", "ip.check_checksum:TRUE"],
+            *["-o", "udp.check_checksum:TRUE"],
+            *["-o", "tcp.check_checksum:TRUE"],
         ],
         cwd=capture.parent,
         capture_output=True,
@@ -128,10 +148,14 @@ def as_value(field: Field, text: str) -> Value:
     two different spellings of the same number.
     """
     match field.type:
+        case FieldType.INT:
+            return int(text)
         case FieldType.UINT:
             return int(text, 0) if text.lower().startswith("0x") else int(text)
         case FieldType.BOOL:
-            return bool(int(text, 0))
+            # Wireshark writes a flag as an item with nothing in it, so its
+            # being there at all is what says the flag is set.
+            return True if text == "" else bool(int(text, 0))
         case FieldType.IPV4:
             return IPv4Address(text)
         case FieldType.IPV6:
@@ -156,11 +180,23 @@ def compare(tree: ProtocolTree, expected: Fields, skip: Container[str] = ()) -> 
         for node in tree.walk()
         if node.value is not None and node.name in expected and node.name not in skip
     }
-    ours = {
-        name: [node.value for node in tree.walk() if node.name == name and node.value is not None]
-        for name in names
-    }
-    theirs = {
-        name: [as_value(REGISTRY.fields[name], text) for text in expected[name]] for name in names
-    }
+    ours: dict[str, object] = {}
+    theirs: dict[str, object] = {}
+    for name in names:
+        values = [
+            node.value for node in tree.walk() if node.name == name and node.value is not None
+        ]
+        texts = expected[name]
+        if all(text == "" for text in texts):
+            # Wireshark can write the same flag twice for one packet, once in
+            # its analysis tree and once as expert information, so for these
+            # it is whether the flag is there that is compared.
+            ours[name], theirs[name] = set(values), {True}
+            continue
+        # tshark writes a field that repeats as repeated keys of one JSON
+        # object, and merging those gathers them all where the first one was,
+        # which loses the order they came in. So for these it is the values
+        # and how many of each that are compared, not the order.
+        ours[name] = sorted(values, key=repr)
+        theirs[name] = sorted((as_value(REGISTRY.fields[name], text) for text in texts), key=repr)
     assert ours == theirs

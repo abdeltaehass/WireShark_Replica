@@ -21,7 +21,7 @@ from pilotfish.core.capture import (
     default_device,
     list_devices,
 )
-from pilotfish.core.dissect import dissect
+from pilotfish.core.dissect import Session, dissect
 from pilotfish.core.filters import FilterError
 
 type Backend = Literal["libpcap", "bpf"]
@@ -107,6 +107,7 @@ def run(
         capture.stop()
 
     table = PacketTable(out, time_format)
+    session = Session()
     shown = 0
     failure: CaptureError | None = None
     previous = signal.signal(signal.SIGINT, interrupt)
@@ -118,7 +119,7 @@ def run(
             if interrupts > 1:
                 break
             shown += 1
-            table.write_row(shown, packet, dissect(packet, shown))
+            table.write_row(shown, packet, dissect(packet, shown, session=session))
             if shown == count:
                 break
             if not capture.pending:

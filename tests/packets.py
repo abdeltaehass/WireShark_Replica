@@ -1,6 +1,7 @@
 """Compiled filters and the packets to try them on, shared by the filter tests."""
 
-from ipaddress import IPv6Address
+import struct
+from ipaddress import IPv4Address, IPv6Address, ip_address
 
 from pilotfish.core.filters import Instruction, Program
 
@@ -62,10 +63,22 @@ ACCEPTED = 262144
 """What DNS_OVER_ETHERNET returns for a packet it keeps."""
 
 
-def ethernet(payload: bytes, ethertype: int = 0x0800) -> bytes:
-    destination = b"\x02\x00\x00\x00\x00\x01"
-    source = b"\x02\x00\x00\x00\x00\x02"
-    return destination + source + ethertype.to_bytes(2, "big") + payload
+CLIENT_MAC = "02:00:00:00:00:02"
+SERVER_MAC = "02:00:00:00:00:01"
+
+
+def mac(address: str) -> bytes:
+    return bytes.fromhex(address.replace(":", ""))
+
+
+def ethernet(
+    payload: bytes,
+    ethertype: int = 0x0800,
+    *,
+    source: str = CLIENT_MAC,
+    destination: str = SERVER_MAC,
+) -> bytes:
+    return mac(destination) + mac(source) + ethertype.to_bytes(2, "big") + payload
 
 
 def checksum(data: bytes) -> int:
@@ -86,6 +99,8 @@ def ipv4(
     options: bytes = b"",
     *,
     flags: int = 0b010,
+    source: str = "192.0.2.1",
+    destination: str = "192.0.2.2",
     break_checksum: bool = False,
 ) -> bytes:
     """An IPv4 header, with ``options`` after the fixed part."""
@@ -94,7 +109,7 @@ def ipv4(
     header = bytes([0x40 | words, 0]) + (20 + len(options) + len(payload)).to_bytes(2, "big")
     header += b"\x00\x01" + (flags << 13 | fragment_offset).to_bytes(2, "big")
     header += bytes([64, protocol]) + b"\x00\x00"
-    header += bytes([192, 0, 2, 1]) + bytes([192, 0, 2, 2])
+    header += IPv4Address(source).packed + IPv4Address(destination).packed
     whole = header + options
     value = checksum(whole) ^ (0xFFFF if break_checksum else 0)
     return whole[:10] + value.to_bytes(2, "big") + whole[12:] + payload
@@ -118,6 +133,15 @@ def icmp_echo(
     return icmp(kind, 0, rest, break_checksum=break_checksum)
 
 
+def pseudo_header(source: str, destination: str, protocol: int, length: int) -> bytes:
+    """The bytes a transport checksum covers besides its own, which differ
+    between IPv4 and IPv6."""
+    first, second = ip_address(source), ip_address(destination)
+    if isinstance(first, IPv4Address):
+        return first.packed + second.packed + bytes([0, protocol]) + length.to_bytes(2, "big")
+    return first.packed + second.packed + length.to_bytes(4, "big") + bytes([0, 0, 0, protocol])
+
+
 def icmpv6(
     kind: int,
     code: int,
@@ -128,12 +152,7 @@ def icmpv6(
 ) -> bytes:
     """An ICMPv6 message, checksummed over the IPv6 pseudo header as well."""
     message = bytes([kind, code]) + b"\x00\x00" + rest
-    pseudo = (
-        IPv6Address(source).packed
-        + IPv6Address(destination).packed
-        + len(message).to_bytes(4, "big")
-        + bytes([0, 0, 0, 58])
-    )
+    pseudo = pseudo_header(source, destination, 58, len(message))
     return message[:2] + checksum(pseudo + message).to_bytes(2, "big") + message[4:]
 
 
@@ -149,6 +168,61 @@ def ipv6(
     return header + IPv6Address(source).packed + IPv6Address(destination).packed + payload
 
 
-def udp(source_port: int, destination_port: int, payload: bytes = b"hello") -> bytes:
+def udp(
+    source_port: int,
+    destination_port: int,
+    payload: bytes = b"hello",
+    *,
+    source: str | None = None,
+    destination: str | None = None,
+    break_checksum: bool = False,
+) -> bytes:
+    """A UDP datagram, with no checksum unless it is given the addresses to
+    take one over. Over IPv4 a zero means there isn't one."""
     header = source_port.to_bytes(2, "big") + destination_port.to_bytes(2, "big")
-    return header + (8 + len(payload)).to_bytes(2, "big") + b"\x00\x00" + payload
+    datagram = header + (8 + len(payload)).to_bytes(2, "big") + b"\x00\x00" + payload
+    if source is None or destination is None:
+        return datagram
+    pseudo = pseudo_header(source, destination, 17, len(datagram))
+    value = checksum(pseudo + datagram) ^ (0xFFFF if break_checksum else 0)
+    return datagram[:6] + value.to_bytes(2, "big") + datagram[8:]
+
+
+def tcp(
+    source_port: int = 50000,
+    destination_port: int = 80,
+    payload: bytes = b"",
+    *,
+    seq: int = 1000,
+    ack: int = 0,
+    flags: int = 0x010,
+    window: int = 8192,
+    options: bytes = b"",
+    urgent: int = 0,
+    source: str = "192.0.2.1",
+    destination: str = "192.0.2.2",
+    break_checksum: bool = False,
+) -> bytes:
+    """A TCP segment, checksummed over the pseudo header of its addresses.
+
+    ``options`` goes after the fixed header and sets the header length, so it
+    has to be a whole number of words, padded as a real sender pads it.
+    """
+    assert len(options) % 4 == 0
+    words = 5 + len(options) // 4
+    header = struct.pack(
+        ">HHIIBBHHH",
+        source_port,
+        destination_port,
+        seq,
+        ack,
+        words << 4 | flags >> 8,
+        flags & 0xFF,
+        window,
+        0,
+        urgent,
+    )
+    segment = header + options + payload
+    pseudo = pseudo_header(source, destination, 6, len(segment))
+    value = checksum(pseudo + segment) ^ (0xFFFF if break_checksum else 0)
+    return segment[:16] + value.to_bytes(2, "big") + segment[18:]

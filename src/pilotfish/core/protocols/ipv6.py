@@ -19,7 +19,7 @@ from pilotfish.core.dissect import (
     register,
 )
 from pilotfish.core.protocols.ethernet import ETHERTYPE, ETHERTYPE_IPV6
-from pilotfish.core.protocols.ip import IP_PROTO, IP_VERSION, LINKTYPE_IPV6
+from pilotfish.core.protocols.ip import IP_PROTO, IP_VERSION, LINKTYPE_IPV6, cut_short
 from pilotfish.core.protocols.loopback import (
     AF_INET6_BSD,
     AF_INET6_DARWIN,
@@ -103,7 +103,7 @@ class IPv6(Dissector):
         context.describe(f"{source} → {destination}")
         reader.summarize(f"Internet Protocol Version 6, Src: {source}, Dst: {destination}")
         payload = reader.payload(payload_length)
-        context.truncated = payload.remaining < payload_length
+        context.truncated = cut_short(payload, payload_length, context.packet)
         if next_header == PROTO_NO_NEXT_HEADER or not payload.remaining:
             return None
         return Handoff(IP_PROTO, next_header, payload)

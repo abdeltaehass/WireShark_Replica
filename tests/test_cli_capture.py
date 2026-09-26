@@ -31,7 +31,7 @@ def row(number: int) -> str:
     """How ``fake_packet(number)`` is listed as row ``number``."""
     return (
         f"{number:>7}  {number}.000000000{'':<9}  {'192.0.2.1':<21}  {'192.0.2.2':<21}  "
-        f"{'IPv4':<8}      47  192.0.2.1 → 192.0.2.2\n"
+        f"{'UDP':<8}      47  {1024 + number} → 53 Len=5\n"
     )
 
 

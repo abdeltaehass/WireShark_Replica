@@ -17,6 +17,8 @@ class FieldType(StrEnum):
     PROTOCOL = "protocol"
     """A layer of the tree rather than a value of its own."""
     UINT = "uint"
+    INT = "int"
+    """A signed number, as a field that reports -1 for "not known" needs."""
     BOOL = "bool"
     BYTES = "bytes"
     STRING = "string"

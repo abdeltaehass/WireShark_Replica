@@ -87,7 +87,10 @@ class Icmp(Dissector):
         code = reader.uint8("icmp.code")
         reader.uint16("icmp.checksum")
         with reader.inside():
-            status = ChecksumStatus.UNVERIFIED if context.truncated else verify(message)
+            # A message quoted inside an error holds only its first bytes,
+            # so there is nothing there to add up.
+            unverifiable = context.truncated or context.in_error
+            status = ChecksumStatus.UNVERIFIED if unverifiable else verify(message)
             reader.add("icmp.checksum.status", int(status))
         reader.summarize(self.title)
 

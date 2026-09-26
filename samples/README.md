@@ -47,7 +47,15 @@ in different byte orders, each written in both byte orders.
 Small captures built by `scripts/make_test_captures.py`, a few packets each,
 for what the wiki samples don't carry: VLAN tags, ICMP over Ethernet, ICMPv6
 with neighbour discovery, IPv6 extension header chains, BSD loopback, and
-headers whose checksums deliberately don't add up. The script writes each
+headers whose checksums deliberately don't add up. `tcp.pcap` is two
+connections written to provoke every judgement the TCP analysis can make —
+retransmissions of three kinds, duplicate acknowledgements, a gap, a
+re-ordered segment, a shut window with its probe and answer, a keep-alive, a
+full window, a window update, and acknowledgements of data the capture never
+saw — because real captures of a healthy network hardly ever contain them.
+The times matter as much as the sequence numbers there: whether a late segment
+counts as re-ordering or as a resend depends on how long after the other end's
+last acknowledgement it arrived. The script writes each
 packet field by field, and tshark decoding them in the answer keys is the
 check that they were built right.
 

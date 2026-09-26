@@ -12,6 +12,7 @@ _PYTHON_TYPES: dict[FieldType, type | tuple[type, ...]] = {
     # A layer has no value of its own, so nothing is a valid one.
     FieldType.PROTOCOL: (),
     FieldType.UINT: int,
+    FieldType.INT: int,
     FieldType.BOOL: bool,
     FieldType.BYTES: (bytes, memoryview),
     FieldType.STRING: str,

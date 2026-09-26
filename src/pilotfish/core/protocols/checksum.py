@@ -35,9 +35,26 @@ def internet_checksum(*parts: Buffer) -> int:
     return ~total & 0xFFFF
 
 
+def folded_sum(*parts: Buffer) -> int:
+    """The sum itself, before it is turned into a checksum."""
+    return ~internet_checksum(*parts) & 0xFFFF
+
+
 def verify(*parts: Buffer) -> ChecksumStatus:
     """Whether bytes that still hold their checksum add up."""
     return ChecksumStatus.GOOD if internet_checksum(*parts) == 0 else ChecksumStatus.BAD
+
+
+def offloaded(pseudo: Buffer, checksum: int) -> bool:
+    """Whether a checksum is the sum of the pseudo header on its own.
+
+    A card that takes the checksum over from the kernel is handed that sum to
+    start from and fills in the rest as it sends, so a packet captured on its
+    way out of the machine often carries the half-finished sum instead of a
+    finished checksum. Wireshark reads that as offloading rather than as
+    damage, and so does pilotfish.
+    """
+    return checksum == folded_sum(pseudo)
 
 
 def pseudo_header(

@@ -28,9 +28,16 @@ TSHARK_FILTER = "not frame.cb_pen"
 # Table output, exact counts, packet count, earliest and latest time, epoch seconds.
 CAPINFOS_FLAGS = ("-T", "-M", "-c", "-a", "-e", "-S")
 
-# Wireshark leaves the IPv4 header checksum unchecked unless it is asked,
-# and the dissector tests compare pilotfish's checksum flags with its.
-TSHARK_PREFERENCES = ("-o", "ip.check_checksum:TRUE")
+# Wireshark leaves checksums unchecked unless it is asked, and the dissector
+# tests compare pilotfish's checksum flags with its.
+TSHARK_PREFERENCES = (
+    "-o",
+    "ip.check_checksum:TRUE",
+    "-o",
+    "udp.check_checksum:TRUE",
+    "-o",
+    "tcp.check_checksum:TRUE",
+)
 
 # The dissector tests compare against every field tshark decodes. That output
 # is large, so it is stored gzipped, and only for the captures that carry

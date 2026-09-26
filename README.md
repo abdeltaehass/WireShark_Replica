@@ -79,19 +79,65 @@ recorded, and ends in whatever nothing has claimed.
 | Link | Ethernet II, 802.1Q VLAN tags, BSD loopback (lo0 and the utun tunnels), bare IP for tunnels captured raw |
 | Network | IPv4 with its options and fragmentation, IPv6 with hop-by-hop, routing, fragment and destination options headers, ARP |
 | Control | ICMP and ICMPv6, including neighbour discovery and the packet quoted inside an error message |
+| Transport | UDP, and TCP with its options, its connections followed across a capture, and Wireshark's judgements about each segment |
 
 Header checksums are verified and reported the way Wireshark reports them:
 good, bad, or unverified when the capture holds less of the packet than the
 header says it carries. ICMPv6's checksum covers a pseudo header of the IPv6
 addresses, so a message delivered to the wrong address fails the check. With
 a routing header present, the checksum is taken over the last address in it,
-which is the address the packet is really going to.
+which is the address the packet is really going to. UDP and TCP take their
+checksums over a pseudo header too, and a checksum that turns out to be the
+sum of that pseudo header on its own is read as a checksum the network card
+had not finished rather than as damage, which is what you see when you capture
+your own machine's outgoing packets.
 
 An error message quotes the packet that caused it, and that packet is decoded
 too, as the next layer. It describes itself but doesn't take over the summary,
 which is why the report of a port being unreachable still says so.
 
-`pilotfish fields` lists all 135 field names pilotfish can decode, with their
+#### What a TCP connection's history says
+
+Most of a header can be read straight out of the packet. The rest only makes
+sense once a whole connection has been watched, so a capture carries a session
+that the dissectors keep their state in: which conversations have been seen,
+and what each end of each connection has sent.
+
+Sequence numbers are shown counted from the start of their own connection, as
+Wireshark shows them, so a connection starts at 0 instead of at the random
+number it chose. A connection joined halfway has no handshake to count from,
+and its first segment becomes 1. The window is shown both as it was written
+and as it means once the handshake's scaling is taken into account, with -1 for
+a connection whose handshake wasn't captured and -2 for one that never asked
+for scaling — again, Wireshark's spellings.
+
+```console
+$ pilotfish read samples/made/tcp.pcap
+    No.  Time                  Source                 Destination            Protocol  Length  Info
+      5  1700000000.040000000  192.0.2.1              192.0.2.2              TCP          154  [TCP Previous segment not captured] 50000 → 80 [PSH, ACK] Seq=301 Ack=1 Win=8000 Len=100
+      6  1700000000.041000000  192.0.2.1              192.0.2.2              TCP          154  [TCP Retransmission] 50000 → 80 [PSH, ACK] Seq=101 Ack=1 Win=8000 Len=100
+     11  1700000000.160000000  192.0.2.2              192.0.2.1              TCP           54  [TCP Dup ACK 8#2] 80 → 50000 [ACK] Seq=1 Ack=401 Win=8000 Len=0
+     12  1700000000.165000000  192.0.2.1              192.0.2.2              TCP          154  [TCP Fast Retransmission] 50000 → 80 [PSH, ACK] Seq=401 Ack=1 Win=8000 Len=100
+     16  1700000000.510000000  192.0.2.2              192.0.2.1              TCP           54  [TCP ZeroWindowProbeAck] [TCP ZeroWindow] 80 → 50000 [ACK] Seq=1 Ack=501 Win=0 Len=0
+     17  1700000000.600000000  192.0.2.2              192.0.2.1              TCP           54  [TCP Window Update] 80 → 50000 [ACK] Seq=1 Ack=501 Win=8000 Len=0
+```
+
+(Rows from a capture written to provoke all of this; a healthy connection says
+nothing of the sort.)
+
+From the same history come the judgements Wireshark makes about a segment: a
+retransmission, a fast or spurious one, an out-of-order segment, a duplicate
+acknowledgement, a lost segment, an acknowledgement of something that was
+never captured, a zero window and the probe and answer that follow it, a
+keep-alive and its answer, a full window and a window update. These are
+worked out the way `tcp_analyze_sequence_number` works them out, down to
+measuring re-ordering against the handshake's round trip, and the tests compare
+every flag against tshark's for every packet of every sample, in both
+directions: a flag pilotfish failed to raise fails the build as surely as one
+it raised wrongly. The one-line summaries agree with tshark's Info column too,
+word for word, for every packet whose innermost protocol is TCP.
+
+`pilotfish fields` lists all 210 field names pilotfish can decode, with their
 types. These are the names display filters will use, and they are Wireshark's
 names, so what you know from there works here:
 
@@ -291,7 +337,18 @@ and with what value: an EtherType, an IP protocol number, a port. The
 registry turns that into the next dissector, so protocols find each other by
 value rather than by calling each other. An IPv6 extension header is just
 another link in that chain, which is why the chain handles them without
-knowing anything about them.
+knowing anything about them. A transport protocol hands over both of its
+ports, the lower one first, so a well-known port wins over the ephemeral one
+at the other end, and it names a list of dissectors to ask when neither port
+means anything, which is how a protocol on an unusual port can still be
+recognised by how its payload starts.
+
+Dissectors hold no state between packets. What has to outlive a packet — the
+conversations a capture holds, what each end of a TCP connection has sent —
+lives in a session, which the reader and the capture create once and hand to
+every packet. Each dissector asks the session for its own store, so one
+protocol can't tread on another's, and decoding a file twice starts from
+nothing both times.
 
 Every field is checked against tshark. `tshark -T json` for each sample
 capture is recorded beside it, and the tests compare every field pilotfish
@@ -371,7 +428,7 @@ Stage 2: Decoding
 
 - [x] Phase 5: the dissector framework
 - [x] Phase 6: link and network layers
-- [ ] Phase 7: TCP and UDP
+- [x] Phase 7: TCP and UDP
 - [ ] Phase 8: application protocols
 - [ ] Phase 9: reassembling fragments and streams
 

@@ -25,6 +25,7 @@ from pilotfish.core.dissect.engine import MAX_LAYERS, Data, Frame, as_data, diss
 from pilotfish.core.dissect.errors import MalformedError
 from pilotfish.core.dissect.fields import Field, FieldRegistry, FieldType, Value
 from pilotfish.core.dissect.reader import Reader
+from pilotfish.core.dissect.session import Session
 from pilotfish.core.dissect.tree import Node, ProtocolTree
 
 __all__ = [
@@ -45,6 +46,7 @@ __all__ = [
     "ProtocolTree",
     "Reader",
     "Registry",
+    "Session",
     "Value",
     "as_data",
     "dissect",

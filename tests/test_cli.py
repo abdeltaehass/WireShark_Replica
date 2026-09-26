@@ -204,3 +204,31 @@ def test_fields_command_lists_what_pilotfish_decodes(capsys: pytest.CaptureFixtu
     listed = [line.split(maxsplit=2) for line in capsys.readouterr().out.splitlines()]
     assert ["frame.time_epoch", "time", "Epoch arrival time"] in listed
     assert ["frame", "protocol", "Frame"] in listed
+
+
+def test_read_marks_what_the_tcp_analysis_found(capsys: pytest.CaptureFixture[str]) -> None:
+    """The packet list says what a segment is, in front of the rest of the line.
+
+    These are the same notes, in the same words and the same order, that
+    tshark's Info column carries.
+    """
+    samples = Path(__file__).resolve().parent.parent / "samples"
+    assert main(["read", str(samples / "made" / "tcp.pcap")]) == 0
+    rows = capsys.readouterr().out.splitlines()
+    marked = {
+        int(row.split()[0]): row.split("  ")[-1]
+        for row in rows[1:]
+        if "[TCP " in row.split("  ")[-1]
+    }
+    assert marked[5] == (
+        "[TCP Previous segment not captured] 50000 → 80 [PSH, ACK] Seq=301 Ack=1 Win=8000 Len=100"
+    )
+    assert marked[11].startswith("[TCP Dup ACK 8#2] ")
+    assert marked[12].startswith("[TCP Fast Retransmission] ")
+    assert marked[13].startswith("[TCP Spurious Retransmission] ")
+    assert marked[16].startswith("[TCP ZeroWindowProbeAck] [TCP ZeroWindow] ")
+    assert marked[22].startswith("[TCP Keep-Alive] ")
+    assert marked[33].startswith("[TCP Out-Of-Order] ")
+    assert marked[34].startswith("[TCP ACKed unseen segment] ")
+    # The handshake's options are listed the way tshark lists them.
+    assert rows[1].endswith("50000 → 80 [SYN] Seq=0 Win=8000 Len=0 MSS=1460 WS=1 SACK_PERM")

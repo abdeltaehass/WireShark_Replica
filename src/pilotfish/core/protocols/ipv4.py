@@ -17,7 +17,7 @@ from pilotfish.core.dissect import (
 )
 from pilotfish.core.protocols.checksum import ChecksumStatus, verify
 from pilotfish.core.protocols.ethernet import ETHERTYPE, ETHERTYPE_IPV4
-from pilotfish.core.protocols.ip import IP_PROTO, IP_VERSION, LINKTYPE_IPV4
+from pilotfish.core.protocols.ip import IP_PROTO, IP_VERSION, LINKTYPE_IPV4, cut_short
 from pilotfish.core.protocols.loopback import AF_INET, NULL_FAMILY
 
 HEADER_SIZE = 20
@@ -117,7 +117,7 @@ class IPv4(Dissector):
         reader.summarize(f"Internet Protocol Version 4, Src: {source}, Dst: {destination}")
         declared = max(total_length - header_length, 0)
         payload = reader.payload(declared)
-        context.truncated = payload.remaining < declared
+        context.truncated = cut_short(payload, declared, context.packet)
         if fragment_offset or flags & FLAG_MORE_FRAGMENTS:
             # Only the first fragment starts with the header of what follows,
             # and even that is only half a message. Reassembly comes later.
