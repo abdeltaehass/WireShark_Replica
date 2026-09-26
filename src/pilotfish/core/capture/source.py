@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from typing import Protocol
 
+from pilotfish.core.filters.program import Program
 from pilotfish.core.packet import Packet
 
 MAX_SNAPLEN = 262_144
@@ -22,6 +23,9 @@ class CaptureOptions:
     """Deliver each packet as it arrives rather than when the kernel buffer fills."""
     timeout_ms: int = 100
     """Longest a read waits when no packets arrive, which bounds how long stopping takes."""
+    filter: str | None = None
+    """A capture filter such as ``udp port 53``. The kernel runs it over every
+    packet and hands over only those that match."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +47,8 @@ class PacketSource(Protocol):
     warning: str | None
     """A problem that didn't stop the capture from starting, such as an
     interface that can't enter promiscuous mode."""
+    program: Program | None
+    """The compiled capture filter the kernel is running, if one was asked for."""
 
     def read(self) -> Packet | None:
         """Wait for the next packet. ``None`` means the timeout passed without one."""

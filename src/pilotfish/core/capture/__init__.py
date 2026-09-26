@@ -11,7 +11,7 @@ been given access to them, as Wireshark's ChmodBPF does.
 from pilotfish.core.capture.bpf import BpfSource
 from pilotfish.core.capture.errors import CaptureError, CapturePermissionError
 from pilotfish.core.capture.interfaces import Device, default_device, list_devices
-from pilotfish.core.capture.libpcap import PcapSource
+from pilotfish.core.capture.libpcap import PcapSource, compile_filter
 from pilotfish.core.capture.live import DEFAULT_QUEUE_SIZE, LiveCapture
 from pilotfish.core.capture.source import (
     MAX_SNAPLEN,
@@ -32,6 +32,7 @@ __all__ = [
     "LiveCapture",
     "PacketSource",
     "PcapSource",
+    "compile_filter",
     "default_device",
     "list_devices",
 ]

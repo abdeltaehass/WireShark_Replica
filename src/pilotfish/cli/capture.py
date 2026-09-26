@@ -20,6 +20,7 @@ from pilotfish.core.capture import (
     default_device,
     list_devices,
 )
+from pilotfish.core.filters import FilterError
 
 type Backend = Literal["libpcap", "bpf"]
 
@@ -43,21 +44,35 @@ def main(
     time_format: TimeFormat,
     count: int | None,
     queue_size: int,
+    print_filter: bool = False,
 ) -> int:
     """Open the interface, then capture until Ctrl+C or ``count`` packets."""
     try:
         devices = list_devices()
         name = interface or default_device(devices).name
         source = _SOURCES[backend](name, options)
+    except FilterError as error:
+        print(f"pilotfish: {error}", file=sys.stderr)
+        return 1
     except CaptureError as error:
         print(f"pilotfish: {error}", file=sys.stderr)
         if isinstance(error, CapturePermissionError):
             print(f"pilotfish: {PERMISSION_HINT}", file=sys.stderr)
         return 1
+    if print_filter:
+        # The filter had to be compiled for this interface's link type, which
+        # is why the interface is opened even though nothing is captured.
+        program = source.program
+        source.close()
+        for line in program.disassemble() if program else []:
+            print(line)
+        return 0
     if source.warning:
         print(f"pilotfish: {name}: warning: {source.warning}", file=sys.stderr)
     description = next((d.description for d in devices if d.name == name), None)
-    print(f"Capturing on {name}" + (f" ({description})" if description else ""), file=sys.stderr)
+    where = f"{name}" + (f" ({description})" if description else "")
+    filtering = f', filter "{options.filter}"' if options.filter else ""
+    print(f"Capturing on {where}{filtering}", file=sys.stderr)
     # A terminal gets a write per line by default. Packets arrive in bursts,
     # so run() flushes itself whenever it has caught up.
     if isinstance(sys.stdout, io.TextIOWrapper):

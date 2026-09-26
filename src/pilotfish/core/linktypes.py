@@ -60,6 +60,8 @@ _DLT_TO_LINKTYPE: dict[int, int] = {
     149: 258,  # DLT_PKTAP, which macOS defines as DLT_USER2
 }
 
+_LINKTYPE_TO_DLT: dict[int, int] = {link_type: dlt for dlt, link_type in _DLT_TO_LINKTYPE.items()}
+
 
 def link_type_name(link_type: int) -> str:
     """The registry name without its ``LINKTYPE_`` prefix, such as ``ETHERNET``."""
@@ -69,3 +71,8 @@ def link_type_name(link_type: int) -> str:
 def link_type_from_dlt(dlt: int) -> int:
     """The LINKTYPE value for a DLT value that a live capture on macOS reports."""
     return _DLT_TO_LINKTYPE.get(dlt, dlt)
+
+
+def dlt_from_link_type(link_type: int) -> int:
+    """The DLT value for a LINKTYPE value, which libpcap's filter compiler wants."""
+    return _LINKTYPE_TO_DLT.get(link_type, link_type)

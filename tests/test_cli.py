@@ -7,6 +7,7 @@ import pytest
 from builders import pcap_header, pcap_record
 from pilotfish import __version__
 from pilotfish.cli.main import main
+from programs import ethernet, ipv4, udp
 
 
 def test_version_flag(capsys: pytest.CaptureFixture[str]) -> None:
@@ -72,3 +73,43 @@ def test_read_prints_packets_before_a_truncation(
     output = capsys.readouterr()
     assert output.out.count("\n") == 2  # header and the one whole packet
     assert "is cut short: 2 of 3 bytes" in output.err
+
+
+@pytest.mark.macos
+def test_read_with_a_capture_filter(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    capture = write_pcap(
+        tmp_path / "mixed.pcap",
+        pcap_record("<", 1, 0, ethernet(ipv4(udp(1234, 80)))),
+        pcap_record("<", 2, 0, ethernet(ipv4(udp(1234, 53)))),
+        pcap_record("<", 3, 0, ethernet(ipv4(udp(53, 1234)))),
+    )
+    assert main(["read", "-f", "udp port 53", str(capture)]) == 0
+    listed = capsys.readouterr().out.splitlines()
+    assert len(listed) == 3  # the header and the two DNS packets
+    # Packets keep the numbers they have in the file, as tshark's do.
+    assert [line.split()[0] for line in listed[1:]] == ["2", "3"]
+
+
+@pytest.mark.macos
+def test_read_with_a_filter_that_will_not_compile(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    capture = write_pcap(tmp_path / "one.pcap", pcap_record("<", 1, 0, ethernet(ipv4(udp(1, 53)))))
+    assert main(["read", "-f", "udp porrt 53", str(capture)]) == 1
+    output = capsys.readouterr()
+    assert output.out == ""  # the error comes before any listing
+    assert output.err == (
+        'pilotfish: capture filter "udp porrt 53": can\'t parse filter expression: syntax error\n'
+    )
+
+
+@pytest.mark.macos
+def test_read_filters_every_link_type_in_a_file(capsys: pytest.CaptureFixture[str]) -> None:
+    # This capture has an Ethernet interface and a Linux SLL one, so the
+    # filter is compiled for each: the headers in front of the packets differ,
+    # and so do the offsets the program reads. tshark and tcpdump also count
+    # 178 ICMP packets here.
+    samples = Path(__file__).resolve().parent.parent / "samples"
+    capture = samples / "wireshark-wiki" / "pcapng-example.pcapng"
+    assert main(["read", "-f", "icmp", str(capture)]) == 0
+    assert len(capsys.readouterr().out.splitlines()) == 1 + 178

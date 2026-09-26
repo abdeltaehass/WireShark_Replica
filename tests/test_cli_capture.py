@@ -11,7 +11,15 @@ from fakes import FakeSource, fake_packet
 from loopback import LoopbackTraffic
 from pilotfish.cli import capture, interfaces
 from pilotfish.cli.main import main
-from pilotfish.core.capture import CaptureOptions, CapturePermissionError, Device, PacketSource
+from pilotfish.core.capture import (
+    CaptureOptions,
+    CapturePermissionError,
+    Device,
+    PacketSource,
+    PcapSource,
+)
+from pilotfish.core.filters import FilterError
+from programs import DNS_OVER_ETHERNET, DNS_OVER_ETHERNET_IMAGE
 
 HEADER = "    No.  Time                   Length  Captured  Link type\n"
 
@@ -206,3 +214,64 @@ def test_ctrl_c_ends_a_real_capture(backend: str) -> None:
     assert "packets captured\n" in err or "packet captured\n" in err
     assert "dropped by kernel\n" in err
     assert err.endswith(" dropped by pilotfish (queue full)\n")
+
+
+def test_print_filter_prints_the_program(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = FakeSource(program=DNS_OVER_ETHERNET)
+    use_sources(monkeypatch, lambda interface, options: source)
+    assert main(["capture", "-f", "udp port 53", "-d"]) == 0
+    output = capsys.readouterr()
+    assert output.out == "".join(f"{line}\n" for line in DNS_OVER_ETHERNET_IMAGE)
+    assert output.err == ""  # nothing is captured, so nothing is reported
+    assert source.closed
+
+
+def test_print_filter_needs_a_filter(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        main(["capture", "-d"])
+    assert exc_info.value.code == 2
+    assert "--print-filter needs a filter" in capsys.readouterr().err
+
+
+def test_the_filter_reaches_the_source(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    opened: list[CaptureOptions] = []
+
+    def open_source(interface: str, options: CaptureOptions) -> PacketSource:
+        opened.append(options)
+        return FakeSource([fake_packet(1)])
+
+    use_sources(monkeypatch, open_source)
+    assert main(["capture", "-c", "1", "-f", "udp port 53"]) == 0
+    assert [options.filter for options in opened] == ["udp port 53"]
+    assert 'Capturing on fake0 (Fake Ethernet), filter "udp port 53"' in capsys.readouterr().err
+
+
+def test_a_filter_that_will_not_compile(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def open_source(interface: str, options: CaptureOptions) -> PacketSource:
+        raise FilterError('capture filter "udp porrt 53": syntax error')
+
+    use_sources(monkeypatch, open_source)
+    assert main(["capture", "-f", "udp porrt 53"]) == 1
+    assert capsys.readouterr().err == ('pilotfish: capture filter "udp porrt 53": syntax error\n')
+
+
+@pytest.mark.macos
+@pytest.mark.usefixtures("capture_access")
+def test_a_live_filter_lists_only_matching_packets() -> None:
+    with LoopbackTraffic() as wanted, LoopbackTraffic() as other:
+        source = PcapSource("lo0", CaptureOptions(filter=f"udp port {wanted.port}"))
+        for _ in range(3):
+            other.send()
+        payloads = [wanted.send(), wanted.send()]
+        out, err = io.StringIO(), io.StringIO()
+        assert capture.run(source, count=len(payloads), out=out, err=err) == 0
+    rows = out.getvalue().splitlines()[1:]
+    assert len(rows) == len(payloads)
+    assert all(row.endswith("NULL") for row in rows)
+    assert err.getvalue().startswith("2 packets captured\n")

@@ -53,6 +53,13 @@ def build_parser() -> argparse.ArgumentParser:
         description="List the packets in a pcap or pcapng file.",
     )
     read_parser.add_argument("file", type=Path, help="capture file to read")
+    read_parser.add_argument(
+        "-f",
+        "--filter",
+        metavar="EXPRESSION",
+        help="list only the packets a capture filter keeps, such as 'udp port 53'; "
+        "pilotfish runs the compiled program itself",
+    )
     _add_time_format(read_parser)
 
     capture_parser = commands.add_parser(
@@ -67,6 +74,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--interface",
         help="interface to capture on, such as en0 (default: the first connected "
         "one; see `pilotfish interfaces`)",
+    )
+    capture_parser.add_argument(
+        "-f",
+        "--filter",
+        metavar="EXPRESSION",
+        help="capture filter in libpcap syntax, such as 'udp port 53' or "
+        "'host 192.0.2.5 and not port 22'; the kernel drops everything else",
+    )
+    capture_parser.add_argument(
+        "-d",
+        "--print-filter",
+        action="store_true",
+        help="print the filter's compiled BPF program, as tcpdump -d does, and exit",
     )
     capture_parser.add_argument(
         "-c", "--count", type=_positive_int, help="stop after this many packets"
@@ -129,13 +149,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "read":
-            return read.run(args.file, args.time_format)
+            return read.run(args.file, args.time_format, filter_text=args.filter)
         if args.command == "capture":
+            if args.print_filter and args.filter is None:
+                parser.error("--print-filter needs a filter to print: pass -f EXPRESSION")
             options = CaptureOptions(
                 snaplen=args.snapshot_length,
                 promiscuous=not args.no_promiscuous_mode,
                 buffer_size=args.buffer_size * 1024,
                 immediate=not args.no_immediate_mode,
+                filter=args.filter,
             )
             return capture.main(
                 args.interface,
@@ -144,6 +167,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 time_format=args.time_format,
                 count=args.count,
                 queue_size=args.queue_size,
+                print_filter=args.print_filter,
             )
         if args.command == "interfaces":
             return interfaces.run()

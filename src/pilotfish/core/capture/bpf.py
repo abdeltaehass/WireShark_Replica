@@ -20,7 +20,9 @@ import struct
 from collections.abc import Buffer, Iterator
 
 from pilotfish.core.capture.errors import CaptureError, CapturePermissionError
+from pilotfish.core.capture.libpcap import compile_filter, interface_netmask
 from pilotfish.core.capture.source import CaptureOptions, KernelStats
+from pilotfish.core.filters.program import Program
 from pilotfish.core.linktypes import link_type_from_dlt
 from pilotfish.core.packet import Packet
 from pilotfish.core.timestamps import NS_PER_SECOND
@@ -60,10 +62,6 @@ _STATS = struct.Struct("=II")
 _IFREQ = struct.Struct(f"={IFNAMSIZ}s16x")
 _TIMEVAL = struct.Struct("=qi4x")
 _PROGRAM = struct.Struct("=I4xQ")  # instruction count, pointer to the instructions
-_INSTRUCTION = struct.Struct("=HBBI")  # opcode, jump if true, jump if false, constant
-
-_BPF_RET_K = 0x06
-"""``BPF_RET | BPF_K``: accept the packet, keeping the number of bytes in the constant."""
 
 _BPF_HEADER = struct.Struct("=IIIIH")
 """``struct bpf_hdr`` up to its trailing padding: the timestamp as a
@@ -189,17 +187,28 @@ class BpfSource:
         seconds, milliseconds = divmod(options.timeout_ms, 1000)
         self._ioctl(fd, "BIOCSRTIMEOUT", BIOCSRTIMEOUT, _TIMEVAL.pack(seconds, milliseconds * 1000))
 
-        # BPF has no snapshot length setting. The filter program's return value
-        # is how many bytes of each packet to keep, so a one-instruction
-        # program that returns snaplen for every packet sets it.
-        instructions = ctypes.create_string_buffer(
-            _INSTRUCTION.pack(_BPF_RET_K, 0, 0, options.snaplen)
+        # BPF has no snapshot length setting: a filter program's return value
+        # is how many bytes of each packet to keep. With no filter that is a
+        # one-instruction program returning the snapshot length, and a
+        # compiled filter returns it for the packets it accepts and 0 for the
+        # rest. libpcap's parser compiles the filter text; reading the packets
+        # still doesn't go through libpcap.
+        self.program = (
+            compile_filter(options.filter, dlt, options.snaplen, interface_netmask(self.interface))
+            if options.filter is not None
+            else None
         )
-        program = _PROGRAM.pack(1, ctypes.addressof(instructions))
-        self._ioctl(fd, "BIOCSETF", BIOCSETF, program)
+        self._set_filter(fd, self.program or Program.accept(options.snaplen))
 
         # A read must ask for exactly the buffer length, so find out what the kernel chose.
         (self.buffer_length,) = _U32.unpack(self._ioctl(fd, "BIOCGBLEN", BIOCGBLEN, bytes(4)))
+
+    def _set_filter(self, fd: int, program: Program) -> None:
+        """Hand the kernel the instructions to run over every packet."""
+        instructions = ctypes.create_string_buffer(program.to_bytes())
+        self._ioctl(
+            fd, "BIOCSETF", BIOCSETF, _PROGRAM.pack(len(program), ctypes.addressof(instructions))
+        )
 
     def _ioctl(self, fd: int, name: str, request: int, argument: bytes) -> bytes:
         """Run an ioctl whose argument is a struct. Returns the struct as the kernel left it."""

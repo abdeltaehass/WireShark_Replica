@@ -5,6 +5,7 @@ import time
 from collections.abc import Iterable
 
 from pilotfish.core.capture import CaptureError, KernelStats
+from pilotfish.core.filters import Program
 from pilotfish.core.packet import Packet
 
 
@@ -35,8 +36,10 @@ class FakeSource:
         fail_after: int | None = None,
         stats_fail: bool = False,
         warning: str | None = None,
+        program: Program | None = None,
     ) -> None:
         self.warning = warning
+        self.program = program
         self._packets = list(packets)
         self._next = 0
         self._fail_after = fail_after

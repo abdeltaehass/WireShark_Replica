@@ -22,6 +22,11 @@ class LoopbackTraffic:
         self._receiver.bind(("127.0.0.1", 0))
         self._sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
+    @property
+    def port(self) -> int:
+        """The port it sends to, for filters that pick out this traffic."""
+        return int(self._receiver.getsockname()[1])
+
     def send(self, size: int = 32) -> bytes:
         """Send a datagram of random bytes, which no other traffic will match, and return them."""
         payload = secrets.token_bytes(size)

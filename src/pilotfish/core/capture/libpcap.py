@@ -26,6 +26,7 @@ from ctypes import (
     c_ubyte,
     c_uint,
     c_uint8,
+    c_uint16,
     c_uint32,
     c_void_p,
 )
@@ -33,6 +34,8 @@ from typing import Any
 
 from pilotfish.core.capture.errors import CaptureError, CapturePermissionError
 from pilotfish.core.capture.source import CaptureOptions, KernelStats
+from pilotfish.core.filters.errors import FilterError
+from pilotfish.core.filters.program import Instruction, Program
 from pilotfish.core.linktypes import link_type_from_dlt
 from pilotfish.core.packet import Packet
 from pilotfish.core.timestamps import NS_PER_SECOND
@@ -43,6 +46,9 @@ this path, but ``dlopen`` finds it there."""
 
 ERRBUF_SIZE = 256
 """``PCAP_ERRBUF_SIZE``: room for the error messages libpcap writes."""
+
+PCAP_NETMASK_UNKNOWN = 0xFFFFFFFF
+"""Netmask to compile with when it isn't known. Only ``broadcast`` filters need it."""
 
 # Status codes from pcap_activate and pcap_next_ex. Negative values are
 # errors and positive values from pcap_activate are warnings.
@@ -127,6 +133,25 @@ PcapIf._fields_ = [
     ("flags", c_uint32),
 ]
 
+
+class BpfInsn(Structure):
+    """``struct bpf_insn``, one instruction of a compiled filter."""
+
+    _fields_ = [("code", c_uint16), ("jt", c_uint8), ("jf", c_uint8), ("k", c_uint32)]
+    code: int
+    jt: int
+    jf: int
+    k: int
+
+
+class BpfProgram(Structure):
+    """``struct bpf_program``: how many instructions a filter has, and where."""
+
+    _fields_ = [("bf_len", c_uint), ("bf_insns", POINTER(BpfInsn))]
+    bf_len: int
+    bf_insns: "ctypes._Pointer[BpfInsn]"
+
+
 # pcap_t is opaque, so handles travel as c_void_p. Declaring every argument
 # type matters: without it ctypes passes Python ints as 32-bit C ints and
 # would cut 64-bit pointers in half.
@@ -162,6 +187,18 @@ _PROTOTYPES: tuple[tuple[str, Any, tuple[Any, ...]], ...] = (
     ("pcap_statustostr", c_char_p, (c_int,)),
     # void pcap_close(pcap_t *p);
     ("pcap_close", None, (c_void_p,)),
+    # pcap_t *pcap_open_dead(int linktype, int snaplen);
+    ("pcap_open_dead", c_void_p, (c_int, c_int)),
+    # int pcap_compile(pcap_t *p, struct bpf_program *fp, const char *str,
+    #                  int optimize, bpf_u_int32 netmask);
+    ("pcap_compile", c_int, (c_void_p, POINTER(BpfProgram), c_char_p, c_int, c_uint32)),
+    # int pcap_setfilter(pcap_t *p, struct bpf_program *fp);
+    ("pcap_setfilter", c_int, (c_void_p, POINTER(BpfProgram))),
+    # void pcap_freecode(struct bpf_program *fp);
+    ("pcap_freecode", None, (POINTER(BpfProgram),)),
+    # int pcap_lookupnet(const char *device, bpf_u_int32 *netp,
+    #                    bpf_u_int32 *maskp, char *errbuf);
+    ("pcap_lookupnet", c_int, (c_char_p, POINTER(c_uint32), POINTER(c_uint32), c_char_p)),
 )
 
 
@@ -185,6 +222,71 @@ def error_buffer() -> ctypes.Array[c_char]:
 
 def text(message: bytes | None) -> str:
     return (message or b"").decode(errors="replace")
+
+
+def compile_filter(
+    expression: str,
+    link_type: int,
+    snaplen: int,
+    netmask: int = PCAP_NETMASK_UNKNOWN,
+) -> Program:
+    """Compile filter text with libpcap's parser, the way tcpdump does.
+
+    ``link_type`` is the DLT value of the packets the filter will run over,
+    because what a filter has to look at depends on the headers in front of
+    the packet. A matching packet keeps ``snaplen`` bytes.
+    """
+    lib = load()
+    # A dead handle is one that carries a link type and snapshot length for
+    # the compiler, with no interface or file behind it.
+    handle: int | None = lib.pcap_open_dead(link_type, snaplen)
+    if not handle:
+        raise FilterError(f'capture filter "{expression}": libpcap ran out of memory')
+    try:
+        return compile_on(lib, handle, expression, netmask)
+    finally:
+        lib.pcap_close(handle)
+
+
+def compile_on(lib: ctypes.CDLL, handle: int, expression: str, netmask: int) -> Program:
+    """Compile ``expression`` for an open handle and copy out the instructions."""
+    code = BpfProgram()
+    if lib.pcap_compile(handle, byref(code), expression.encode(), 1, netmask) != 0:
+        raise FilterError(f'capture filter "{expression}": {text(lib.pcap_geterr(handle))}')
+    try:
+        return Program(
+            tuple(
+                Instruction(each.code, each.jt, each.jf, each.k)
+                for each in code.bf_insns[: code.bf_len]
+            )
+        )
+    finally:
+        # The instructions are libpcap's to free; pilotfish keeps its own copy.
+        lib.pcap_freecode(byref(code))
+
+
+def set_filter(lib: ctypes.CDLL, handle: int, program: Program) -> None:
+    """Install ``program`` on an activated handle, so the kernel runs it."""
+    instructions = (BpfInsn * len(program))(
+        *(BpfInsn(each.code, each.jt, each.jf, each.k) for each in program)
+    )
+    code = BpfProgram(len(program), ctypes.cast(instructions, POINTER(BpfInsn)))
+    if lib.pcap_setfilter(handle, byref(code)) != 0:
+        raise FilterError(f"can't install the capture filter: {_message(lib, handle, PCAP_ERROR)}")
+
+
+def interface_netmask(interface: str) -> int:
+    """The interface's IPv4 netmask, which filters such as ``broadcast`` need.
+
+    ``PCAP_NETMASK_UNKNOWN`` when libpcap can't work it out, which is what
+    tcpdump uses then too.
+    """
+    lib = load()
+    network = c_uint32()
+    netmask = c_uint32()
+    if lib.pcap_lookupnet(interface.encode(), byref(network), byref(netmask), error_buffer()) != 0:
+        return PCAP_NETMASK_UNKNOWN
+    return netmask.value
 
 
 class PcapSource:
@@ -216,6 +318,13 @@ class PcapSource:
                 raise CaptureError(message)
             self.warning = _message(lib, handle, status) if status > 0 else None
             self.link_type = link_type_from_dlt(lib.pcap_datalink(handle))
+            self.program: Program | None = None
+            if options.filter is not None:
+                # Compiling against this handle uses its own link type and
+                # snapshot length. The kernel runs the program from here on,
+                # so packets that don't match never reach pilotfish.
+                self.program = compile_on(lib, handle, options.filter, interface_netmask(interface))
+                set_filter(lib, handle, self.program)
         except BaseException:
             lib.pcap_close(handle)
             raise

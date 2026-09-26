@@ -5,7 +5,15 @@ import pytest
 
 from loopback import UDP_PAYLOAD_OFFSET, LoopbackTraffic, carrying, read_until
 from pilotfish.core.capture import CaptureError, CaptureOptions, PcapSource
-from pilotfish.core.capture.libpcap import PcapAddr, PcapIf, PcapPkthdr, PcapStat, Timeval
+from pilotfish.core.capture.libpcap import (
+    BpfInsn,
+    BpfProgram,
+    PcapAddr,
+    PcapIf,
+    PcapPkthdr,
+    PcapStat,
+    Timeval,
+)
 
 # Sizes and offsets printed by a C program built against <pcap/pcap.h> in the
 # macOS SDK, so a mistake in a ctypes field list shows up here.
@@ -13,7 +21,15 @@ from pilotfish.core.capture.libpcap import PcapAddr, PcapIf, PcapPkthdr, PcapSta
 
 @pytest.mark.parametrize(
     ("structure", "size"),
-    [(Timeval, 16), (PcapPkthdr, 280), (PcapStat, 12), (PcapIf, 40), (PcapAddr, 40)],
+    [
+        (Timeval, 16),
+        (PcapPkthdr, 280),
+        (PcapStat, 12),
+        (PcapIf, 40),
+        (PcapAddr, 40),
+        (BpfInsn, 8),
+        (BpfProgram, 16),
+    ],
     ids=lambda value: getattr(value, "__name__", str(value)),
 )
 def test_structure_sizes_match_the_sdk(structure: type[ctypes.Structure], size: int) -> None:
@@ -30,6 +46,9 @@ def test_structure_sizes_match_the_sdk(structure: type[ctypes.Structure], size: 
         (PcapIf, "description", 16),
         (PcapIf, "addresses", 24),
         (PcapIf, "flags", 32),
+        (BpfInsn, "jt", 2),
+        (BpfInsn, "k", 4),
+        (BpfProgram, "bf_insns", 8),
     ],
 )
 def test_field_offsets_match_the_sdk(
