@@ -5,6 +5,7 @@ from itertools import chain
 from pathlib import Path
 from typing import TextIO
 
+import pilotfish.core.protocols  # noqa: F401  (registers the dissectors)
 from pilotfish.cli.detail import write_tree
 from pilotfish.cli.table import PacketTable, TimeFormat
 from pilotfish.core.capture import MAX_SNAPLEN, compile_filter

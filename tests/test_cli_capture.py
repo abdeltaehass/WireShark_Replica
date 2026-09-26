@@ -28,14 +28,10 @@ HEADER = (
 
 
 def row(number: int) -> str:
-    """How ``fake_packet(number)`` is listed as row ``number``.
-
-    Nothing decodes Ethernet yet, so a frame is data and the columns that come
-    from a protocol are empty.
-    """
+    """How ``fake_packet(number)`` is listed as row ``number``."""
     return (
-        f"{number:>7}  {number}.000000000{'':<9}  {'':<21}  {'':<21}  "
-        f"{'DATA':<8}      47  Data (47 bytes)\n"
+        f"{number:>7}  {number}.000000000{'':<9}  {'192.0.2.1':<21}  {'192.0.2.2':<21}  "
+        f"{'IPv4':<8}      47  192.0.2.1 → 192.0.2.2\n"
     )
 
 
@@ -215,8 +211,7 @@ def test_ctrl_c_ends_a_real_capture(backend: str) -> None:
         assert process.stdout.readline() == HEADER
         with LoopbackTraffic() as traffic:
             traffic.send()
-            # Nothing decodes the loopback link yet, so the row says data.
-            assert "DATA" in process.stdout.readline()
+            assert "127.0.0.1" in process.stdout.readline()
         process.send_signal(signal.SIGINT)
         _, err = process.communicate()
     finally:
@@ -284,7 +279,6 @@ def test_a_live_filter_lists_only_matching_packets() -> None:
         assert capture.run(source, count=len(payloads), out=out, err=err) == 0
     rows = out.getvalue().splitlines()[1:]
     assert len(rows) == len(payloads)
-    # Every row is a packet the filter let through, listed as data until the
-    # protocols of the next phase can say more about it.
-    assert all("DATA" in row for row in rows)
+    # Loopback traffic, decoded: the addresses are there rather than the link type.
+    assert all("127.0.0.1" in row for row in rows)
     assert err.getvalue().startswith("2 packets captured\n")

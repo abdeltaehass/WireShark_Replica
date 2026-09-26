@@ -14,12 +14,12 @@ shared core, the same split as tshark and Wireshark.
 ## Usage
 
 ```console
-$ pilotfish read samples/wireshark-wiki/dhcp.pcap
+$ pilotfish read samples/made/icmp.pcap
     No.  Time                  Source                 Destination            Protocol  Length  Info
-      1  1102274184.317453000                                                DATA         314  Data (314 bytes)
-      2  1102274184.317748000                                                DATA         342  Data (342 bytes)
-      3  1102274184.387484000                                                DATA         314  Data (314 bytes)
-      4  1102274184.387798000                                                DATA         342  Data (342 bytes)
+      1  1700000000.000000000  192.0.2.1              192.0.2.2              ICMP          51  Echo (ping) request  id=0x00de, seq=1
+      2  1700000001.000000000  192.0.2.2              192.0.2.1              ICMP          51  Echo (ping) reply  id=0x00de, seq=1
+      3  1700000002.000000000  192.0.2.1              192.0.2.2              ICMP          70  Destination unreachable (Port unreachable)
+      4  1700000003.000000000  192.0.2.1              192.0.2.2              ICMP          70  Time-to-live exceeded (Time to live exceeded in transit)
 ```
 
 Each packet is decoded as it is listed, so the columns are the ones tshark
@@ -35,15 +35,38 @@ Simple Packet Blocks, which carry no timestamp, show `-`.
 `-V` prints each packet's protocol tree, as tshark's `-V` does:
 
 ```console
-$ pilotfish read -V samples/wireshark-wiki/dhcp.pcap
-Frame 1: 314 bytes on wire, 314 bytes captured
-    Frame number: 1
-    Frame length: 314
-    Capture length: 314
-    Epoch arrival time: 1102274184.317453000
-Data (314 bytes)
-    Data: ff:ff:ff:ff:ff:ff:00:0b:82:01:fc:42:08:00:45:00:01:2c:a8:36:00:00:fa:11:17:8b:00:00:00:00:ff:ff… (314 bytes)
-    Length: 314
+$ pilotfish read -V samples/made/icmpv6.pcap
+Frame 3: 86 bytes on wire, 86 bytes captured
+    Frame number: 3
+    Frame length: 86
+    Capture length: 86
+    Epoch arrival time: 1700000002.000000000
+Ethernet II, Src: 02:00:00:00:00:01, Dst: 02:00:00:00:00:02
+    Destination: 02:00:00:00:00:02
+    Source: 02:00:00:00:00:01
+    Type: 0x86dd
+Internet Protocol Version 6, Src: 2001:db8::1, Dst: 2001:db8::2
+    Version: 6
+    Traffic Class: 0x00
+        Differentiated Services Codepoint: 0
+        Explicit Congestion Notification: 0
+    Flow Label: 0x00
+    Payload Length: 32
+    Next Header: 58
+    Hop Limit: 64
+    Source Address: 2001:db8::1
+    Destination Address: 2001:db8::2
+Internet Control Message Protocol v6
+    Type: 135
+    Code: 0
+    Checksum: 0xec72
+        Checksum status: 1
+    Reserved: 00:00:00:00
+    Target Address: 2001:db8::2
+    Type: 1
+        Length: 1
+        Link-layer address: 02:00:00:00:00:01
+        Source Link-layer address: 02:00:00:00:00:01
 ```
 
 Every packet starts with a frame layer, from what the capture itself
@@ -51,29 +74,33 @@ recorded, and ends in whatever nothing has claimed.
 
 ### What pilotfish decodes
 
-Nothing yet: this phase is the framework the protocols plug into, so every
-frame comes out as the capture's own metadata and then data. What is here is
-the machinery — a bounds-checked buffer, a reader that records every field it
-reads, a registry that routes one protocol to the next by value, and a tree
-of typed fields — with a made-up protocol in `tests/toy.py` exercising all of
-it, and random bytes fuzzed through every dissector to check that a packet
-which doesn't hold what it claims can only ever come out marked malformed.
+| Layer | Protocols |
+|---|---|
+| Link | Ethernet II, 802.1Q VLAN tags, BSD loopback (lo0 and the utun tunnels), bare IP for tunnels captured raw |
+| Network | IPv4 with its options and fragmentation, IPv6 with hop-by-hop, routing, fragment and destination options headers, ARP |
+| Control | ICMP and ICMPv6, including neighbour discovery and the packet quoted inside an error message |
 
-`pilotfish fields` lists every field name pilotfish can decode, with its type.
-These are the names display filters will use, and they are Wireshark's names,
-so what you know from there works here:
+Header checksums are verified and reported the way Wireshark reports them:
+good, bad, or unverified when the capture holds less of the packet than the
+header says it carries. ICMPv6's checksum covers a pseudo header of the IPv6
+addresses, so a message delivered to the wrong address fails the check. With
+a routing header present, the checksum is taken over the last address in it,
+which is the address the packet is really going to.
+
+An error message quotes the packet that caused it, and that packet is decoded
+too, as the next layer. It describes itself but doesn't take over the summary,
+which is why the report of a port being unreachable still says so.
+
+`pilotfish fields` lists all 135 field names pilotfish can decode, with their
+types. These are the names display filters will use, and they are Wireshark's
+names, so what you know from there works here:
 
 ```console
 $ pilotfish fields
-Name              Type      Description
-data              protocol  Data
-data.data         bytes     Data
-data.len          uint      Length
-frame             protocol  Frame
-frame.cap_len     uint      Capture length
-frame.len         uint      Frame length
-frame.number      uint      Frame number
-frame.time_epoch  time      Epoch arrival time
+Name                                  Type      Description
+arp                                   protocol  Address Resolution Protocol
+arp.dst.hw_mac                        ethernet  Target MAC address
+...
 ```
 
 ### Live capture
@@ -290,6 +317,7 @@ loss into the kernel's buffer, where it's harder to see.
 | `src/pilotfish/core/capture/` | The ctypes binding to libpcap, the direct `/dev/bpf` reader and the capture thread |
 | `src/pilotfish/core/filters/` | Compiled capture filters: their instructions, the disassembler and an interpreter |
 | `src/pilotfish/core/dissect/` | The dissector framework: the bounds-checked buffer, the field registry and the protocol tree |
+| `src/pilotfish/core/protocols/` | One module per protocol, each registering itself with the framework |
 | `src/pilotfish/cli/` | Command line tool |
 | `src/pilotfish/gui/` | PySide6 desktop app |
 | `tests/` | pytest and Hypothesis tests |
@@ -342,7 +370,7 @@ Stage 1: Capture
 Stage 2: Decoding
 
 - [x] Phase 5: the dissector framework
-- [ ] Phase 6: link and network layers
+- [x] Phase 6: link and network layers
 - [ ] Phase 7: TCP and UDP
 - [ ] Phase 8: application protocols
 - [ ] Phase 9: reassembling fragments and streams

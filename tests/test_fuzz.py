@@ -15,6 +15,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+import pilotfish.core.protocols  # noqa: F401  (registers the dissectors to fuzz)
 import toy
 from pilotfish.core.dissect import (
     REGISTRY,

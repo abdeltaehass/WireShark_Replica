@@ -7,6 +7,7 @@ from collections.abc import Callable
 from types import FrameType
 from typing import Literal, TextIO
 
+import pilotfish.core.protocols  # noqa: F401  (registers the dissectors)
 from pilotfish.cli.table import PacketTable, TimeFormat
 from pilotfish.core.capture import (
     DEFAULT_QUEUE_SIZE,

@@ -45,9 +45,6 @@ def write_pcap(path: Path, *records: bytes) -> Path:
 
 
 def test_read_lists_packets(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    # Nothing decodes Ethernet yet, so every frame is data, and the columns
-    # that come from a protocol are empty. The protocols of the next phase
-    # fill them in without the table knowing anything new.
     ping = ethernet(ipv4(icmp_echo(sequence=1), protocol=1))
     capture = write_pcap(
         tmp_path / "two.pcap",
@@ -58,11 +55,11 @@ def test_read_lists_packets(tmp_path: Path, capsys: pytest.CaptureFixture[str]) 
     assert capsys.readouterr().out == (
         "    No.  Time                  Source                 Destination            "
         "Protocol  Length  Info\n"
-        "      1  1084443427.311224000                                                "
-        "DATA          51  Data (51 bytes)\n"
-        # The second packet was cut short, so only 40 of its 1514 bytes are here.
-        "      2  1084443428.222534000                                                "
-        "DATA        1514  Data (40 bytes)\n"
+        "      1  1084443427.311224000  192.0.2.1              192.0.2.2              "
+        "ICMP          51  Echo (ping) request  id=0x00de, seq=1\n"
+        "      2  1084443428.222534000  192.0.2.1              192.0.2.2              "
+        # The second packet was cut short, so its ICMP header ran out.
+        "ICMP        1514  192.0.2.1 → 192.0.2.2 [Malformed Packet]\n"
     )
 
 
@@ -144,7 +141,13 @@ def test_read_prints_the_protocol_tree(tmp_path: Path, capsys: pytest.CaptureFix
         "    Frame length: 47\n"
         "    Capture length: 47\n"
         "    Epoch arrival time: 1112172466.496046000\n"
-        "Data (47 bytes)\n"
+        "Ethernet II, Src: 02:00:00:00:00:02, Dst: 02:00:00:00:00:01\n"
+        "    Destination: 02:00:00:00:00:01\n"
+        "    Source: 02:00:00:00:00:02\n"
+        "    Type: 0x0800\n"
+        "Internet Protocol Version 4, Src: 192.0.2.1, Dst: 192.0.2.2\n"
+        "    Version: 4\n"
+        "    Header Length: 20\n"
     )
     # A blank line between packets, and the second one is there too.
     assert "\n\nFrame 2: 47 bytes on wire, 47 bytes captured\n" in listed

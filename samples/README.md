@@ -42,6 +42,15 @@ at commit `9a5c416`, flattened into `be/` and `le/`. MIT licensed; see
 Packet Blocks, custom blocks, all options, and files with several sections
 in different byte orders, each written in both byte orders.
 
+### `made/`
+
+Small captures built by `scripts/make_test_captures.py`, a few packets each,
+for what the wiki samples don't carry: VLAN tags, ICMP over Ethernet, ICMPv6
+with neighbour discovery, IPv6 extension header chains, BSD loopback, and
+headers whose checksums deliberately don't add up. The script writes each
+packet field by field, and tshark decoding them in the answer keys is the
+check that they were built right.
+
 ### `private/`
 
 Captures you record yourself. Git ignores this folder, answer keys
