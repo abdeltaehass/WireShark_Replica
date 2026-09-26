@@ -6,6 +6,9 @@ from Wireshark's own tools by `scripts/update_answer_keys.py`:
 - `<file>.tshark.tsv`: tshark's time, length, captured length and interface
   for every packet
 - `<file>.capinfos.tsv`: capinfos's packet count and earliest and latest time
+- `<file>.tshark.json.gz`: every field tshark decodes, gzipped because it is
+  large. The dissector tests compare field values against it. Captures that
+  only exercise the file format don't have one.
 
 `tests/test_samples.py` checks pilotfish against both, so CI doesn't need
 Wireshark installed.

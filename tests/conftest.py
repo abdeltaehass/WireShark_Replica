@@ -5,6 +5,8 @@ from pilotfish.core.capture import CapturePermissionError, PcapSource
 
 # Shared CI runners have noisy timing, so a per-example deadline only adds flaky failures.
 settings.register_profile("pilotfish", deadline=None)
+# A longer run for the dissector fuzzing: pytest --hypothesis-profile=fuzz
+settings.register_profile("fuzz", deadline=None, max_examples=10_000)
 settings.load_profile("pilotfish")
 
 

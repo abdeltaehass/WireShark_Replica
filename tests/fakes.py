@@ -4,18 +4,20 @@ import threading
 import time
 from collections.abc import Iterable
 
+from packets import ethernet, ipv4, udp
 from pilotfish.core.capture import CaptureError, KernelStats
 from pilotfish.core.filters import Program
 from pilotfish.core.packet import Packet
 
 
 def fake_packet(number: int) -> Packet:
-    """Packet ``number``: stamped ``number`` seconds after the epoch, 60 bytes captured."""
+    """Packet ``number``: an Ethernet frame stamped ``number`` seconds in."""
+    data = ethernet(ipv4(udp(1024 + number, 53)))
     return Packet(
         timestamp_ns=number * 1_000_000_000,
-        original_length=60 + number,
+        original_length=len(data),
         link_type=1,
-        data=bytes([number % 256]) * 60,
+        data=data,
     )
 
 

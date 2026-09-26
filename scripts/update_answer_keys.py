@@ -1,9 +1,10 @@
 """Record what tshark and capinfos report for each sample capture.
 
-For every capture file under samples/, this writes two answer keys beside it:
+For every capture file under samples/, this writes answer keys beside it:
 
-    <capture>.tshark.tsv    one row per packet, from ``tshark -T fields``
-    <capture>.capinfos.tsv  packet count and earliest and latest packet time
+    <capture>.tshark.tsv      one row per packet, from ``tshark -T fields``
+    <capture>.capinfos.tsv    packet count and earliest and latest packet time
+    <capture>.tshark.json.gz  every field tshark decodes, for the dissectors
 
 The tests compare pilotfish's reader with these files, so CI doesn't need
 Wireshark installed. Run it after adding a sample:
@@ -12,6 +13,7 @@ Wireshark installed. Run it after adding a sample:
     uv run scripts/update_answer_keys.py FILE [FILE ...]
 """
 
+import gzip
 import subprocess
 import sys
 from pathlib import Path
@@ -25,6 +27,16 @@ TSHARK_FIELDS = ("frame.time_epoch", "frame.len", "frame.cap_len", "frame.interf
 TSHARK_FILTER = "not frame.cb_pen"
 # Table output, exact counts, packet count, earliest and latest time, epoch seconds.
 CAPINFOS_FLAGS = ("-T", "-M", "-c", "-a", "-e", "-S")
+
+# Wireshark leaves the IPv4 header checksum unchecked unless it is asked,
+# and the dissector tests compare pilotfish's checksum flags with its.
+TSHARK_PREFERENCES = ("-o", "ip.check_checksum:TRUE")
+
+# The dissector tests compare against every field tshark decodes. That output
+# is large, so it is stored gzipped, and only for the captures that carry
+# protocols worth comparing: the pcapng-test-generator files exercise the file
+# format instead, and pcapng-example.pcapng alone decodes to 1.6 MB.
+NO_JSON_KEY = ("pcapng-test-generator", "pcapng-example.pcapng")
 
 
 def find_captures() -> list[Path]:
@@ -42,11 +54,19 @@ def write_answer_keys(capture: Path) -> None:
     # Run from the capture's folder so capinfos records only the file name,
     # not a path from this machine.
     fields = [arg for field in TSHARK_FIELDS for arg in ("-e", field)]
-    tshark = ["tshark", "-n", "-r", capture.name, "-Y", TSHARK_FILTER, "-T", "fields"]
-    tshark += ["-E", "header=y", *fields]
-    capture.with_name(capture.name + ".tshark.tsv").write_text(run_tool(tshark, capture.parent))
+    tshark = ["tshark", "-n", "-r", capture.name, "-Y", TSHARK_FILTER, "-T"]
+    rows = [*tshark, "fields", "-E", "header=y", *fields]
+    capture.with_name(capture.name + ".tshark.tsv").write_text(run_tool(rows, capture.parent))
     capinfos = ["capinfos", *CAPINFOS_FLAGS, capture.name]
     capture.with_name(capture.name + ".capinfos.tsv").write_text(run_tool(capinfos, capture.parent))
+
+    key = capture.with_name(capture.name + ".tshark.json.gz")
+    if any(part in NO_JSON_KEY for part in (*capture.parts, capture.name)):
+        key.unlink(missing_ok=True)
+        return
+    decoded = run_tool([*tshark, "json", *TSHARK_PREFERENCES], capture.parent)
+    # A fixed timestamp keeps re-recording from changing bytes that didn't.
+    key.write_bytes(gzip.compress(decoded.encode(), compresslevel=9, mtime=0))
 
 
 def main(argv: list[str]) -> None:

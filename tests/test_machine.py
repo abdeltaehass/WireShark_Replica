@@ -5,6 +5,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+from packets import ACCEPTED, DNS_OVER_ETHERNET, ethernet, ipv4, ipv6, program, udp
 from pilotfish.core.capture import compile_filter
 from pilotfish.core.capture.libpcap import BpfInsn, load
 from pilotfish.core.filters import FilterError, Instruction, Program
@@ -44,7 +45,6 @@ from pilotfish.core.filters.program import (
     BPF_W,
     BPF_X,
 )
-from programs import ACCEPTED, DNS_OVER_ETHERNET, ethernet, ipv4, ipv6, program, udp
 
 KEEP = Instruction(BPF_RET | BPF_A)
 """Return whatever is in the accumulator, so a test can read it."""
@@ -81,7 +81,7 @@ class TestTheDnsFilter:
 
     def test_reads_ports_past_ipv4_options(self) -> None:
         # ldxb 4*([14]&0xf) is why the ports are found after a longer header.
-        assert matches(DNS_OVER_ETHERNET, ethernet(ipv4(udp(49152, 53), options=12)))
+        assert matches(DNS_OVER_ETHERNET, ethernet(ipv4(udp(49152, 53), options=bytes(12))))
 
     def test_drops_a_later_fragment(self) -> None:
         # A fragment past the first carries no ports to compare.

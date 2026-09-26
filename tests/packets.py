@@ -1,5 +1,7 @@
 """Compiled filters and the packets to try them on, shared by the filter tests."""
 
+from ipaddress import IPv6Address
+
 from pilotfish.core.filters import Instruction, Program
 
 
@@ -66,19 +68,85 @@ def ethernet(payload: bytes, ethertype: int = 0x0800) -> bytes:
     return destination + source + ethertype.to_bytes(2, "big") + payload
 
 
-def ipv4(payload: bytes, protocol: int = 17, fragment_offset: int = 0, options: int = 0) -> bytes:
-    """An IPv4 header, with room for ``options`` bytes after the fixed part."""
-    words = 5 + options // 4
-    header = bytes([0x40 | words, 0]) + (20 + options + len(payload)).to_bytes(2, "big")
-    header += b"\x00\x01" + fragment_offset.to_bytes(2, "big")
+def checksum(data: bytes) -> int:
+    """The internet checksum, worked out here rather than taken from pilotfish,
+    so that a test packet and the dissector checking it agree by accident."""
+    if len(data) % 2:
+        data += b"\x00"
+    total = sum(int.from_bytes(data[i : i + 2], "big") for i in range(0, len(data), 2))
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    return ~total & 0xFFFF
+
+
+def ipv4(
+    payload: bytes,
+    protocol: int = 17,
+    fragment_offset: int = 0,
+    options: bytes = b"",
+    *,
+    flags: int = 0b010,
+    break_checksum: bool = False,
+) -> bytes:
+    """An IPv4 header, with ``options`` after the fixed part."""
+    assert len(options) % 4 == 0
+    words = 5 + len(options) // 4
+    header = bytes([0x40 | words, 0]) + (20 + len(options) + len(payload)).to_bytes(2, "big")
+    header += b"\x00\x01" + (flags << 13 | fragment_offset).to_bytes(2, "big")
     header += bytes([64, protocol]) + b"\x00\x00"
     header += bytes([192, 0, 2, 1]) + bytes([192, 0, 2, 2])
-    return header + bytes(options) + payload
+    whole = header + options
+    value = checksum(whole) ^ (0xFFFF if break_checksum else 0)
+    return whole[:10] + value.to_bytes(2, "big") + whole[12:] + payload
 
 
-def ipv6(payload: bytes, next_header: int = 17) -> bytes:
+def icmp(kind: int, code: int, rest: bytes, *, break_checksum: bool = False) -> bytes:
+    message = bytes([kind, code]) + b"\x00\x00" + rest
+    value = checksum(message) ^ (0xFFFF if break_checksum else 0)
+    return message[:2] + value.to_bytes(2, "big") + message[4:]
+
+
+def icmp_echo(
+    kind: int = 8,
+    *,
+    identifier: int = 0x00DE,
+    sequence: int = 1,
+    payload: bytes = b"pilotfish",
+    break_checksum: bool = False,
+) -> bytes:
+    rest = identifier.to_bytes(2, "big") + sequence.to_bytes(2, "big") + payload
+    return icmp(kind, 0, rest, break_checksum=break_checksum)
+
+
+def icmpv6(
+    kind: int,
+    code: int,
+    rest: bytes,
+    *,
+    source: str = "2001:db8::1",
+    destination: str = "2001:db8::2",
+) -> bytes:
+    """An ICMPv6 message, checksummed over the IPv6 pseudo header as well."""
+    message = bytes([kind, code]) + b"\x00\x00" + rest
+    pseudo = (
+        IPv6Address(source).packed
+        + IPv6Address(destination).packed
+        + len(message).to_bytes(4, "big")
+        + bytes([0, 0, 0, 58])
+    )
+    return message[:2] + checksum(pseudo + message).to_bytes(2, "big") + message[4:]
+
+
+def ipv6(
+    payload: bytes,
+    next_header: int = 17,
+    *,
+    source: str = "2001:db8::1",
+    destination: str = "2001:db8::2",
+) -> bytes:
+    """An IPv6 header, with the addresses the icmpv6 helper checksums over."""
     header = b"\x60\x00\x00\x00" + len(payload).to_bytes(2, "big") + bytes([next_header, 64])
-    return header + bytes(16) + bytes(16) + payload
+    return header + IPv6Address(source).packed + IPv6Address(destination).packed + payload
 
 
 def udp(source_port: int, destination_port: int, payload: bytes = b"hello") -> bytes:

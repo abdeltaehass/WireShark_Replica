@@ -7,37 +7,95 @@ what it shows. It has a command line tool and a desktop app built on one
 shared core, the same split as tshark and Wireshark.
 
 > **Status:** early development. pilotfish reads pcap and pcapng files,
-> captures live traffic and filters it; decoding protocols comes next.
+> captures live traffic, filters it, and decodes Ethernet, VLAN tags, ARP,
+> loopback, IPv4, IPv6, ICMP and ICMPv6 into named fields. TCP and UDP come
+> next.
 
 ## Usage
 
 ```console
-$ pilotfish read samples/wireshark-wiki/dhcp-nanosecond.pcap
-    No.  Time                   Length  Captured  Link type
-      1  1102274184.317453000      314       314  ETHERNET
-      2  1102274184.317748000      342       342  ETHERNET
-      3  1102274184.387484000      314       314  ETHERNET
-      4  1102274184.387798000      342       342  ETHERNET
+$ pilotfish read samples/wireshark-wiki/dhcp.pcap
+    No.  Time                  Source                 Destination            Protocol  Length  Info
+      1  1102274184.317453000                                                DATA         314  Data (314 bytes)
+      2  1102274184.317748000                                                DATA         342  Data (342 bytes)
+      3  1102274184.387484000                                                DATA         314  Data (314 bytes)
+      4  1102274184.387798000                                                DATA         342  Data (342 bytes)
 ```
+
+Each packet is decoded as it is listed, so the columns are the ones tshark
+shows: who sent it, who to, the innermost protocol decoded, and a one-line
+summary of what it says. A packet that doesn't hold what its headers claim is
+listed with `[Malformed Packet]` rather than being dropped.
 
 `--time-format utc` shows dates instead of epoch seconds. Packets from pcapng
 Simple Packet Blocks, which carry no timestamp, show `-`.
+
+### Decoding
+
+`-V` prints each packet's protocol tree, as tshark's `-V` does:
+
+```console
+$ pilotfish read -V samples/wireshark-wiki/dhcp.pcap
+Frame 1: 314 bytes on wire, 314 bytes captured
+    Frame number: 1
+    Frame length: 314
+    Capture length: 314
+    Epoch arrival time: 1102274184.317453000
+Data (314 bytes)
+    Data: ff:ff:ff:ff:ff:ff:00:0b:82:01:fc:42:08:00:45:00:01:2c:a8:36:00:00:fa:11:17:8b:00:00:00:00:ff:ff… (314 bytes)
+    Length: 314
+```
+
+Every packet starts with a frame layer, from what the capture itself
+recorded, and ends in whatever nothing has claimed.
+
+### What pilotfish decodes
+
+Nothing yet: this phase is the framework the protocols plug into, so every
+frame comes out as the capture's own metadata and then data. What is here is
+the machinery — a bounds-checked buffer, a reader that records every field it
+reads, a registry that routes one protocol to the next by value, and a tree
+of typed fields — with a made-up protocol in `tests/toy.py` exercising all of
+it, and random bytes fuzzed through every dissector to check that a packet
+which doesn't hold what it claims can only ever come out marked malformed.
+
+`pilotfish fields` lists every field name pilotfish can decode, with its type.
+These are the names display filters will use, and they are Wireshark's names,
+so what you know from there works here:
+
+```console
+$ pilotfish fields
+Name              Type      Description
+data              protocol  Data
+data.data         bytes     Data
+data.len          uint      Length
+frame             protocol  Frame
+frame.cap_len     uint      Capture length
+frame.len         uint      Frame length
+frame.number      uint      Frame number
+frame.time_epoch  time      Epoch arrival time
+```
 
 ### Live capture
 
 ```console
 $ sudo .venv/bin/pilotfish capture -i en0
 Capturing on en0 (Wi-Fi)
-    No.  Time                   Length  Captured  Link type
-      1  1790090610.599361000       78        78  ETHERNET
-      2  1790090610.685196000       74        74  ETHERNET
-      3  1790090610.685406000       66        66  ETHERNET
+    No.  Time                  Source                 Destination            Protocol  Length  Info
+      1  1790376345.442731000  5.161.7.195            192.168.0.195          IPv4          74  5.161.7.195 → 192.168.0.195
+      2  1790376345.442873000  192.168.0.195          5.161.7.195            IPv4          66  192.168.0.195 → 5.161.7.195
 ^C
-85215 packets captured
-85215 packets received by filter
+75029 packets captured
+75029 packets received by filter
 0 packets dropped by kernel
 0 packets dropped by pilotfish (queue full)
 ```
+
+Packets are decoded as they arrive, which costs time: on this Mac the whole
+path, from the kernel through the dissectors to the screen, keeps up with
+about 14,000 packets a second. Past that the kernel's buffer fills and the
+report says how much it dropped, so the numbers always add up to what really
+arrived.
 
 Packets are listed as they arrive until you press Ctrl+C. The first Ctrl+C
 stops capturing and still lists the packets already captured; a second one
@@ -187,6 +245,33 @@ flowchart LR
 Live capture and saved files both feed one packet store. Everything after it
 is shared by the command line tool and the desktop app.
 
+### How a packet is decoded
+
+Each dissector reads one protocol's header through a `Reader`, over a
+bounds-checked `Buffer`. A read that runs off the end of the packet raises
+`MalformedError`, which the engine turns into a marked packet holding
+whatever was decoded before it: no dissector needs to check a length before
+every field, and no packet can crash the program.
+
+Every read names the field it is reading, so the tree ends up with each
+field's name, type, value and the exact bytes it came from. The names are
+registered up front with their types, which is what lets the detail view
+label them, the hex view highlight them, and display filters be type checked
+against them later.
+
+A dissector ends by saying which table to look the rest of the packet up in,
+and with what value: an EtherType, an IP protocol number, a port. The
+registry turns that into the next dissector, so protocols find each other by
+value rather than by calling each other. An IPv6 extension header is just
+another link in that chain, which is why the chain handles them without
+knowing anything about them.
+
+Every field is checked against tshark. `tshark -T json` for each sample
+capture is recorded beside it, and the tests compare every field pilotfish
+decodes with what Wireshark decoded from the same bytes, values not spellings.
+Random bytes go through every dissector as well, to check that a packet which
+doesn't hold what it claims can only ever be marked malformed.
+
 A capture filter is compiled once and left to the kernel, which runs it over
 every packet before deciding whether to hand it over. pilotfish has its own
 interpreter for the same instructions, which is how a filter can also be
@@ -204,6 +289,7 @@ loss into the kernel's buffer, where it's harder to see.
 | `src/pilotfish/core/` | Capture, decoding, filters and file formats. Standard library only. |
 | `src/pilotfish/core/capture/` | The ctypes binding to libpcap, the direct `/dev/bpf` reader and the capture thread |
 | `src/pilotfish/core/filters/` | Compiled capture filters: their instructions, the disassembler and an interpreter |
+| `src/pilotfish/core/dissect/` | The dissector framework: the bounds-checked buffer, the field registry and the protocol tree |
 | `src/pilotfish/cli/` | Command line tool |
 | `src/pilotfish/gui/` | PySide6 desktop app |
 | `tests/` | pytest and Hypothesis tests |
@@ -233,7 +319,16 @@ themselves. They need access to `/dev/bpf*` and are skipped without it.
 pilotfish's output is checked against `tshark` and `capinfos`, which come with
 Wireshark's command line tools (`brew install wireshark`). Their output for
 each sample is saved beside it, so the tests don't need them; see
-[samples/README.md](samples/README.md) to add a capture.
+[samples/README.md](samples/README.md) to add a capture. Every field tshark
+decodes is recorded too, which is the answer key the dissectors are compared
+against.
+
+Random bytes are fed to every dissector to check that a malformed packet is
+the only thing that can go wrong. For a longer run than the suite's:
+
+```sh
+uv run pytest tests/test_fuzz.py --hypothesis-profile=fuzz
+```
 
 ## Roadmap
 
@@ -243,6 +338,14 @@ Stage 1: Capture
 - [x] Phase 2: read pcap and pcapng files
 - [x] Phase 3: capture live traffic through libpcap
 - [x] Phase 4: capture filters
+
+Stage 2: Decoding
+
+- [x] Phase 5: the dissector framework
+- [ ] Phase 6: link and network layers
+- [ ] Phase 7: TCP and UDP
+- [ ] Phase 8: application protocols
+- [ ] Phase 9: reassembling fragments and streams
 
 ## Capture responsibly
 

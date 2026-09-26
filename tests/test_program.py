@@ -4,6 +4,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+from packets import DNS_OVER_ETHERNET, DNS_OVER_ETHERNET_IMAGE
 from pilotfish.core.capture.libpcap import BpfInsn, load, text
 from pilotfish.core.filters import FilterError, Instruction, Program
 from pilotfish.core.filters.program import (
@@ -35,7 +36,6 @@ from pilotfish.core.filters.program import (
     BPF_W,
     BPF_X,
 )
-from programs import DNS_OVER_ETHERNET, DNS_OVER_ETHERNET_IMAGE
 
 
 def test_disassembles_like_tcpdump() -> None:

@@ -3,6 +3,7 @@ import re
 import pytest
 
 from loopback import UDP_PAYLOAD_OFFSET, LoopbackTraffic, carrying, read_until
+from packets import DNS_OVER_ETHERNET
 from pilotfish.core.capture import (
     MAX_SNAPLEN,
     BpfSource,
@@ -14,7 +15,6 @@ from pilotfish.core.capture import (
 from pilotfish.core.capture.libpcap import PCAP_NETMASK_UNKNOWN, interface_netmask
 from pilotfish.core.filters import FilterError
 from pilotfish.core.packet import Packet
-from programs import DNS_OVER_ETHERNET
 
 type SourceClass = type[PcapSource] | type[BpfSource]
 

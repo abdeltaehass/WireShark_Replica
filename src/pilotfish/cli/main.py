@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from pilotfish import __version__
-from pilotfish.cli import capture, interfaces, read
+from pilotfish.cli import capture, fields, interfaces, read
 from pilotfish.cli.table import TIME_FORMATS
 from pilotfish.core.capture import DEFAULT_QUEUE_SIZE, MAX_SNAPLEN, CaptureOptions
 
@@ -53,6 +53,12 @@ def build_parser() -> argparse.ArgumentParser:
         description="List the packets in a pcap or pcapng file.",
     )
     read_parser.add_argument("file", type=Path, help="capture file to read")
+    read_parser.add_argument(
+        "-V",
+        "--tree",
+        action="store_true",
+        help="print each packet's protocol tree instead of one line per packet",
+    )
     read_parser.add_argument(
         "-f",
         "--filter",
@@ -137,6 +143,13 @@ def build_parser() -> argparse.ArgumentParser:
     _add_time_format(capture_parser)
 
     commands.add_parser(
+        "fields",
+        help="list the fields pilotfish can decode",
+        description="List every field name pilotfish can decode, with its type. "
+        "These are the names display filters use.",
+    )
+
+    commands.add_parser(
         "interfaces",
         help="list the interfaces you can capture on",
         description="List the interfaces you can capture on.",
@@ -149,7 +162,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "read":
-            return read.run(args.file, args.time_format, filter_text=args.filter)
+            return read.run(args.file, args.time_format, filter_text=args.filter, tree=args.tree)
         if args.command == "capture":
             if args.print_filter and args.filter is None:
                 parser.error("--print-filter needs a filter to print: pass -f EXPRESSION")
@@ -169,6 +182,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 queue_size=args.queue_size,
                 print_filter=args.print_filter,
             )
+        if args.command == "fields":
+            return fields.run()
         if args.command == "interfaces":
             return interfaces.run()
         parser.print_help()

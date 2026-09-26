@@ -5,8 +5,10 @@ from itertools import chain
 from pathlib import Path
 from typing import TextIO
 
+from pilotfish.cli.detail import write_tree
 from pilotfish.cli.table import PacketTable, TimeFormat
 from pilotfish.core.capture import MAX_SNAPLEN, compile_filter
+from pilotfish.core.dissect import dissect
 from pilotfish.core.filters import FilterError, Program, machine
 from pilotfish.core.formats import CaptureFile, CaptureFileError
 from pilotfish.core.linktypes import dlt_from_link_type
@@ -18,12 +20,14 @@ def run(
     time_format: TimeFormat,
     *,
     filter_text: str | None = None,
+    tree: bool = False,
     out: TextIO | None = None,
 ) -> int:
     """Print one line per packet: number, timestamp, lengths and link type.
 
-    With a capture filter, packets it doesn't match are left out. They keep
-    their numbers in the file, as tshark's do.
+    With ``tree``, print each packet's protocol tree instead, as tshark's -V
+    does. With a capture filter, packets it doesn't match are left out. They
+    keep their numbers in the file, as tshark's do.
     """
     out = out or sys.stdout
     try:
@@ -44,12 +48,21 @@ def run(
             first = next(packets, None)
             if first is not None and filter_text is not None:
                 _program_for(first[1].link_type, filter_text, programs)
-            table.write_header()
+            if not tree:
+                table.write_header()
             rest = packets if first is None else chain([first], packets)
+            shown = 0
             for number, packet in rest:
                 if filter_text is not None and not _matches(packet, filter_text, programs):
                     continue
-                table.write_row(number, packet)
+                shown += 1
+                decoded = dissect(packet, number)
+                if not tree:
+                    table.write_row(number, packet, decoded)
+                    continue
+                if shown > 1:
+                    out.write("\n")
+                write_tree(decoded, out)
         except CaptureFileError as error:
             out.flush()
             return _fail(path, error)

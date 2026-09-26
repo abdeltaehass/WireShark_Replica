@@ -9,6 +9,7 @@ import pytest
 
 from fakes import FakeSource, fake_packet
 from loopback import LoopbackTraffic
+from packets import DNS_OVER_ETHERNET, DNS_OVER_ETHERNET_IMAGE
 from pilotfish.cli import capture, interfaces
 from pilotfish.cli.main import main
 from pilotfish.core.capture import (
@@ -19,14 +20,23 @@ from pilotfish.core.capture import (
     PcapSource,
 )
 from pilotfish.core.filters import FilterError
-from programs import DNS_OVER_ETHERNET, DNS_OVER_ETHERNET_IMAGE
 
-HEADER = "    No.  Time                   Length  Captured  Link type\n"
+HEADER = (
+    "    No.  Time                  Source                 Destination            "
+    "Protocol  Length  Info\n"
+)
 
 
 def row(number: int) -> str:
-    """How ``fake_packet(number)`` is listed as row ``number``."""
-    return f"{number:>7}  {number}.000000000{'':<9}  {60 + number:>7}        60  ETHERNET\n"
+    """How ``fake_packet(number)`` is listed as row ``number``.
+
+    Nothing decodes Ethernet yet, so a frame is data and the columns that come
+    from a protocol are empty.
+    """
+    return (
+        f"{number:>7}  {number}.000000000{'':<9}  {'':<21}  {'':<21}  "
+        f"{'DATA':<8}      47  Data (47 bytes)\n"
+    )
 
 
 class Output(io.StringIO):
@@ -205,7 +215,8 @@ def test_ctrl_c_ends_a_real_capture(backend: str) -> None:
         assert process.stdout.readline() == HEADER
         with LoopbackTraffic() as traffic:
             traffic.send()
-            assert process.stdout.readline().endswith("  NULL\n")
+            # Nothing decodes the loopback link yet, so the row says data.
+            assert "DATA" in process.stdout.readline()
         process.send_signal(signal.SIGINT)
         _, err = process.communicate()
     finally:
@@ -273,5 +284,7 @@ def test_a_live_filter_lists_only_matching_packets() -> None:
         assert capture.run(source, count=len(payloads), out=out, err=err) == 0
     rows = out.getvalue().splitlines()[1:]
     assert len(rows) == len(payloads)
-    assert all(row.endswith("NULL") for row in rows)
+    # Every row is a packet the filter let through, listed as data until the
+    # protocols of the next phase can say more about it.
+    assert all("DATA" in row for row in rows)
     assert err.getvalue().startswith("2 packets captured\n")

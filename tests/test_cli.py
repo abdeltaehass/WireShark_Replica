@@ -1,13 +1,20 @@
+import io
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
+import toy
 from builders import pcap_header, pcap_record
+from packets import ethernet, icmp_echo, ipv4, udp
 from pilotfish import __version__
+from pilotfish.cli import fields
+from pilotfish.cli.detail import write_tree
 from pilotfish.cli.main import main
-from programs import ethernet, ipv4, udp
+from pilotfish.core.dissect import Field, FieldRegistry, FieldType, ProtocolTree, dissect
+from pilotfish.core.packet import Packet
+from toy import toy_packet
 
 
 def test_version_flag(capsys: pytest.CaptureFixture[str]) -> None:
@@ -38,16 +45,24 @@ def write_pcap(path: Path, *records: bytes) -> Path:
 
 
 def test_read_lists_packets(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    # Nothing decodes Ethernet yet, so every frame is data, and the columns
+    # that come from a protocol are empty. The protocols of the next phase
+    # fill them in without the table knowing anything new.
+    ping = ethernet(ipv4(icmp_echo(sequence=1), protocol=1))
     capture = write_pcap(
         tmp_path / "two.pcap",
-        pcap_record("<", 1_084_443_427, 311_224, b"x" * 62),
-        pcap_record("<", 1_084_443_428, 222_534, b"y" * 54, original_length=1514),
+        pcap_record("<", 1_084_443_427, 311_224, ping),
+        pcap_record("<", 1_084_443_428, 222_534, ping[:40], original_length=1514),
     )
     assert main(["read", str(capture)]) == 0
     assert capsys.readouterr().out == (
-        "    No.  Time                   Length  Captured  Link type\n"
-        "      1  1084443427.311224000       62        62  ETHERNET\n"
-        "      2  1084443428.222534000     1514        54  ETHERNET\n"
+        "    No.  Time                  Source                 Destination            "
+        "Protocol  Length  Info\n"
+        "      1  1084443427.311224000                                                "
+        "DATA          51  Data (51 bytes)\n"
+        # The second packet was cut short, so only 40 of its 1514 bytes are here.
+        "      2  1084443428.222534000                                                "
+        "DATA        1514  Data (40 bytes)\n"
     )
 
 
@@ -113,3 +128,76 @@ def test_read_filters_every_link_type_in_a_file(capsys: pytest.CaptureFixture[st
     capture = samples / "wireshark-wiki" / "pcapng-example.pcapng"
     assert main(["read", "-f", "icmp", str(capture)]) == 0
     assert len(capsys.readouterr().out.splitlines()) == 1 + 178
+
+
+def test_read_prints_the_protocol_tree(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    capture = write_pcap(
+        tmp_path / "trees.pcap",
+        pcap_record("<", 1_112_172_466, 496_046, ethernet(ipv4(udp(1234, 53)))),
+        pcap_record("<", 1_112_172_467, 0, ethernet(ipv4(udp(53, 1234)))),
+    )
+    assert main(["read", "-V", str(capture)]) == 0
+    listed = capsys.readouterr().out
+    assert listed.startswith(
+        "Frame 1: 47 bytes on wire, 47 bytes captured\n"
+        "    Frame number: 1\n"
+        "    Frame length: 47\n"
+        "    Capture length: 47\n"
+        "    Epoch arrival time: 1112172466.496046000\n"
+        "Data (47 bytes)\n"
+    )
+    # A blank line between packets, and the second one is there too.
+    assert "\n\nFrame 2: 47 bytes on wire, 47 bytes captured\n" in listed
+
+
+def detail(tree: ProtocolTree) -> str:
+    out = io.StringIO()
+    write_tree(tree, out)
+    return out.getvalue()
+
+
+def test_the_detail_view_nests_fields_and_spells_out_flags() -> None:
+    packet = Packet(0, len(toy_packet()), toy.TOY_LINK_TYPE, toy_packet())
+    listed = detail(dissect(packet, registry=toy.REGISTRY))
+    assert "Toy Protocol 1, label toy1\n" in listed
+    assert "    Flags: 1\n        Urgent: Set\n        Last: Not set\n" in listed
+    assert "    Source address: 192.0.2.1\n" in listed
+
+
+def test_the_detail_view_marks_a_malformed_packet() -> None:
+    cut = toy_packet()[:10]
+    packet = Packet(0, len(cut), toy.TOY_LINK_TYPE, cut)
+    listed = detail(dissect(packet, registry=toy.REGISTRY))
+    assert listed.endswith(
+        "[Malformed packet: toy: toy.hardware needs 6 bytes at offset 8, but the packet has 2]\n"
+    )
+
+
+def test_the_detail_view_cuts_long_byte_strings_short() -> None:
+    # A link type nothing decodes, so the whole frame stays as data.
+    packet = Packet(0, 100, 147, bytes(range(100)))
+    listed = detail(dissect(packet))
+    assert "    Data: 00:01:02:03:04:05:06:07:08:09:0a:0b:0c:0d:0e:0f" in listed
+    assert "… (100 bytes)\n" in listed
+
+
+def test_fields_lists_name_type_and_description() -> None:
+    registry = FieldRegistry()
+    registry.add(
+        Field("toy.version", FieldType.UINT, "Version"),
+        Field("toy.label", FieldType.STRING, "Label"),
+    )
+    out = io.StringIO()
+    assert fields.run(out=out, registry=registry) == 0
+    assert out.getvalue() == (
+        "Name         Type    Description\n"
+        "toy.label    string  Label\n"
+        "toy.version  uint    Version\n"
+    )
+
+
+def test_fields_command_lists_what_pilotfish_decodes(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["fields"]) == 0
+    listed = [line.split(maxsplit=2) for line in capsys.readouterr().out.splitlines()]
+    assert ["frame.time_epoch", "time", "Epoch arrival time"] in listed
+    assert ["frame", "protocol", "Frame"] in listed
