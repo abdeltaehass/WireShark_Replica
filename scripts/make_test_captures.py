@@ -731,6 +731,91 @@ def ssh_capture() -> list[bytes]:
     return packets
 
 
+TLS_PORT = 443
+TLS_CLIENT_PORT = 50003
+TLS_CLIENT_ISN = 4000
+TLS_SERVER_ISN = 8000
+
+
+def tls_record(kind: int, body: bytes, version: int = 0x0303) -> bytes:
+    return struct.pack(">BHH", kind, version, len(body)) + body
+
+
+def tls_handshake(kind: int, body: bytes) -> bytes:
+    return struct.pack(">B", kind) + len(body).to_bytes(3, "big") + body
+
+
+def tls_extension(kind: int, body: bytes) -> bytes:
+    return struct.pack(">HH", kind, len(body)) + body
+
+
+def tls_capture() -> list[bytes]:
+    """A handshake up to the point where it turns to noise.
+
+    A client says which versions and ciphers it will accept and, in the clear,
+    which server it is asking for; the server picks; and everything after that
+    is encrypted. The lists here are a real macOS client's, including one of
+    the reserved values a client throws in to keep servers honest.
+    """
+    name = b"example.com"
+    server_name = tls_extension(0, struct.pack(">HBH", len(name) + 3, 0, len(name)) + name)
+    alpn = tls_extension(16, struct.pack(">H", 12) + b"\x02h2\x08http/1.1")
+    versions = tls_extension(43, bytes([8]) + struct.pack(">HHHH", 0x0304, 0x0303, 0x0302, 0x0301))
+    groups = tls_extension(10, struct.pack(">HHHH", 6, 0x0A0A, 0x001D, 0x0017))
+    formats = tls_extension(11, bytes([1, 0]))
+    signatures = tls_extension(13, struct.pack(">HHHH", 6, 0x0403, 0x0804, 0x0401))
+    share = bytes(range(32))
+    key_share = tls_extension(51, struct.pack(">HHH", 36, 0x001D, len(share)) + share)
+    suites = (0x1301, 0x1302, 0x1303, 0xC02B)
+
+    hello = struct.pack(">H", 0x0303) + bytes(range(32)) + bytes([32]) + bytes(range(32))
+    hello += struct.pack(">H", len(suites) * 2)
+    hello += b"".join(struct.pack(">H", each) for each in suites)
+    hello += bytes([1, 0])
+    extensions = server_name + alpn + versions + groups + formats + signatures + key_share
+    hello += struct.pack(">H", len(extensions)) + extensions
+    client_hello = tls_record(22, tls_handshake(1, hello), version=0x0301)
+
+    answered = struct.pack(">H", 0x0303) + bytes(range(32, 64)) + bytes([32]) + bytes(range(32))
+    answered += struct.pack(">HB", 0x1301, 0)
+    chosen = tls_extension(43, struct.pack(">H", 0x0304)) + tls_extension(
+        51, struct.pack(">HH", 0x001D, len(share)) + share
+    )
+    answered += struct.pack(">H", len(chosen)) + chosen
+    server_hello = tls_record(22, tls_handshake(2, answered))
+    server_hello += tls_record(20, bytes([1]))
+    server_hello += tls_record(23, bytes(range(64)))
+
+    def segment(
+        sequence: int,
+        acknowledgement: int,
+        flags: int,
+        payload: bytes = b"",
+        from_client: bool = True,
+    ) -> bytes:
+        return tcp(
+            sequence,
+            acknowledgement,
+            flags,
+            payload=payload,
+            from_client=from_client,
+            client_port=TLS_CLIENT_PORT,
+            server_port=TLS_PORT,
+        )
+
+    client, server = TLS_CLIENT_ISN, TLS_SERVER_ISN
+    return [
+        segment(client, 0, SYN),
+        segment(server, client + 1, SYN | ACK, from_client=False),
+        segment(client + 1, server + 1, ACK),
+        segment(client + 1, server + 1, PUSH | ACK, client_hello),
+        segment(
+            server + 1, client + 1 + len(client_hello), PUSH | ACK, server_hello, from_client=False
+        ),
+        segment(client + 1 + len(client_hello), server + 1 + len(server_hello), ACK),
+    ]
+
+
 def main() -> None:
     SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
     write_pcap(SAMPLES_DIR / "vlan.pcap", LINKTYPE_ETHERNET, vlan_capture())
@@ -742,6 +827,7 @@ def main() -> None:
     write_pcap(SAMPLES_DIR / "tcp.pcap", LINKTYPE_ETHERNET, segments, times)
     write_pcap(SAMPLES_DIR / "mdns.pcap", LINKTYPE_ETHERNET, mdns_capture())
     write_pcap(SAMPLES_DIR / "ssh.pcap", LINKTYPE_ETHERNET, ssh_capture())
+    write_pcap(SAMPLES_DIR / "tls.pcap", LINKTYPE_ETHERNET, tls_capture())
 
 
 if __name__ == "__main__":

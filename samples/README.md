@@ -59,7 +59,8 @@ last acknowledgement it arrived. `mdns.pcap` is a Bonjour question and the
 announcement that answers it, whose names are written once and pointed at
 afterwards, so it exercises the compression pointers that make DNS names
 awkward. `ssh.pcap` is a session from the greeting to the point where the
-keys change and there is nothing left to read. The script writes each
+keys change and there is nothing left to read, and `tls.pcap` is a handshake
+up to the same point, carrying the server name a client asks for in the clear. The script writes each
 packet field by field, and tshark decoding them in the answer keys is the
 check that they were built right.
 
