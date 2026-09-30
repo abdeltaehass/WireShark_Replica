@@ -222,13 +222,14 @@ def tcp(
     options: bytes = b"",
     from_client: bool = True,
     client_port: int = CLIENT_PORT,
+    server_port: int = SERVER_PORT,
 ) -> bytes:
     """One TCP segment, checksummed over the IPv4 pseudo header."""
     assert len(options) % 4 == 0
     header = struct.pack(
         ">HHIIBBHHH",
-        client_port if from_client else SERVER_PORT,
-        SERVER_PORT if from_client else client_port,
+        client_port if from_client else server_port,
+        server_port if from_client else client_port,
         sequence,
         acknowledgement,
         (5 + len(options) // 4) << 4,
@@ -557,6 +558,179 @@ def loopback_capture() -> list[bytes]:
     ]
 
 
+MDNS_PORT = 5353
+MDNS_GROUP = "224.0.0.251"
+MDNS_MAC = "01:00:5e:00:00:fb"
+"""The Ethernet address the multicast group maps to."""
+
+CACHE_FLUSH = 0x8000
+UNICAST_RESPONSE = 0x8000
+
+CLASS_IN = 1
+TYPE_A = 1
+TYPE_PTR = 12
+TYPE_TXT = 16
+TYPE_SRV = 33
+
+
+def labels(name: str) -> bytes:
+    """A domain name as DNS writes it: each label with its length in front."""
+    return b"".join(bytes([len(part)]) + part.encode() for part in name.split(".")) + b"\x00"
+
+
+def pointer(offset: int) -> bytes:
+    """A name that isn't written out again, but points into the message."""
+    return struct.pack(">H", 0xC000 | offset)
+
+
+def record(name: bytes, kind: int, data: bytes, *, ttl: int = 4500, flush: bool = False) -> bytes:
+    record_class = 1 | (CACHE_FLUSH if flush else 0)
+    return name + struct.pack(">HHIH", kind, record_class, ttl, len(data)) + data
+
+
+def mdns_capture() -> list[bytes]:
+    """What a Mac announcing itself over Bonjour looks like.
+
+    The response repeats names by pointing at the ones already in the message,
+    which is the part of DNS worth testing: a pointer can aim at any byte of
+    the message, including a name written inside another record's data. The
+    message is built a piece at a time so that every pointer is the offset
+    the piece it names actually landed at.
+    """
+    service = "_airplay._tcp.local"
+    # Two questions: one asking for an answer to the whole group, one asking
+    # for it straight back, which is the "QU" bit in what used to be the class.
+    query = struct.pack(">HHHHHH", 0, 0, 2, 0, 0, 0)
+    query += labels(service) + struct.pack(">HH", TYPE_PTR, CLASS_IN)
+    query += labels("_companion-link._tcp.local")
+    query += struct.pack(">HH", TYPE_PTR, CLASS_IN | UNICAST_RESPONSE)
+
+    message = bytearray(struct.pack(">HHHHHH", 0, 0x8400, 0, 1, 0, 3))
+    service_at = len(message)
+    # Where the "local" label sits inside the service name, which is what the
+    # host name below points at to end itself.
+    local_at = service_at + len(labels("_airplay._tcp")) - 1
+    instance = b"\x0bLiving Room" + pointer(service_at)
+    message += labels(service) + struct.pack(">HHIH", TYPE_PTR, CLASS_IN, 4500, len(instance))
+    instance_at = len(message)
+    message += instance
+
+    host = b"\x0bliving-room" + pointer(local_at)
+    where = struct.pack(">HHH", 0, 0, 7000) + host
+    message += pointer(instance_at)
+    message += struct.pack(">HHIH", TYPE_SRV, CLASS_IN | CACHE_FLUSH, 120, len(where))
+    host_at = len(message) + 6
+    message += where
+
+    # A TXT record is one or more strings, each with its length in front.
+    text = b"".join(bytes([len(each)]) + each for each in (b"model=J1", b"srcvers=665.5"))
+    message += pointer(instance_at)
+    message += struct.pack(">HHIH", TYPE_TXT, CLASS_IN | CACHE_FLUSH, 4500, len(text)) + text
+
+    address = IPv4Address("192.0.2.10").packed
+    message += pointer(host_at)
+    message += struct.pack(">HHIH", TYPE_A, CLASS_IN | CACHE_FLUSH, 120, len(address)) + address
+
+    return [
+        ethernet(
+            ipv4(
+                udp(bytes(payload), source_port=MDNS_PORT, destination_port=MDNS_PORT),
+                PROTO_UDP,
+                source=source,
+                destination=MDNS_GROUP,
+            ),
+            ETHERTYPE_IPV4,
+            source=source_mac,
+            destination=MDNS_MAC,
+        )
+        for payload, source, source_mac in (
+            (query, "192.0.2.1", CLIENT_MAC),
+            (message, "192.0.2.10", SERVER_MAC),
+        )
+    ]
+
+
+SSH_PORT = 22
+SSH_CLIENT_PORT = 50002
+SSH_CLIENT_ISN = 3000
+SSH_SERVER_ISN = 7000
+
+
+def ssh_packet(payload: bytes, *, padding: int = 8) -> bytes:
+    """One SSH binary packet, which is its length, its padding, and the rest.
+
+    Everything after the key exchange is encrypted, so only the packets here
+    are readable; a real capture of a session is mostly opaque.
+    """
+    padded = bytes(padding)
+    length = 1 + len(payload) + len(padded)
+    return struct.pack(">IB", length, len(padded)) + payload + padded
+
+
+def name_list(*names: str) -> bytes:
+    text = ",".join(names).encode()
+    return struct.pack(">I", len(text)) + text
+
+
+def kexinit(*, from_client: bool) -> bytes:
+    """The message each end opens with: everything it is willing to use."""
+    kex = name_list("curve25519-sha256", "diffie-hellman-group14-sha256")
+    keys = (
+        name_list("ssh-ed25519", "rsa-sha2-512")
+        if not from_client
+        else name_list("ssh-ed25519-cert-v01@openssh.com", "ssh-ed25519")
+    )
+    ciphers = name_list("chacha20-poly1305@openssh.com", "aes256-gcm@openssh.com")
+    macs = name_list("hmac-sha2-256-etm@openssh.com", "hmac-sha2-256")
+    compression = name_list("none", "zlib@openssh.com")
+    languages = name_list()
+    body = bytes(range(16))  # the cookie, which is random in a real session
+    body += kex + keys + ciphers + ciphers + macs + macs + compression + compression
+    body += languages + languages
+    body += bytes([0]) + struct.pack(">I", 0)
+    return ssh_packet(bytes([20]) + body)
+
+
+def ssh_capture() -> list[bytes]:
+    """A session up to the point where it turns to noise.
+
+    The two ends greet each other in plain text, say what they can do, agree
+    a key, and everything after that is encrypted.
+    """
+    client, server = SSH_CLIENT_ISN, SSH_SERVER_ISN
+
+    def segment(sequence: int, acknowledgement: int, payload: bytes, *, from_client: bool) -> bytes:
+        return tcp(
+            sequence,
+            acknowledgement,
+            PUSH | ACK,
+            payload=payload,
+            from_client=from_client,
+            client_port=SSH_CLIENT_PORT,
+            server_port=SSH_PORT,
+        )
+
+    greetings = (b"SSH-2.0-OpenSSH_9.6\r\n", b"SSH-2.0-OpenSSH_9.6p1 Debian-3\r\n")
+    client_kex, server_kex = kexinit(from_client=True), kexinit(from_client=False)
+    new_keys = ssh_packet(bytes([21]))
+    # Once both ends have switched keys there is nothing left to read.
+    encrypted = struct.pack(">I", 44) + bytes(range(44))
+    sent = [greetings[0], client_kex, new_keys, encrypted]
+    answered = [greetings[1], server_kex, new_keys]
+    packets = []
+    client_seq, server_seq = client + 1, server + 1
+    for number in range(max(len(sent), len(answered))):
+        payload = sent[number]
+        packets.append(segment(client_seq, server_seq, payload, from_client=True))
+        client_seq += len(payload)
+        if number >= len(answered):
+            continue
+        payload = answered[number]
+        packets.append(segment(server_seq, client_seq, payload, from_client=False))
+        server_seq += len(payload)
+    return packets
+
+
 def main() -> None:
     SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
     write_pcap(SAMPLES_DIR / "vlan.pcap", LINKTYPE_ETHERNET, vlan_capture())
@@ -566,6 +740,8 @@ def main() -> None:
     write_pcap(SAMPLES_DIR / "loopback.pcap", LINKTYPE_NULL, loopback_capture())
     segments, times = tcp_capture()
     write_pcap(SAMPLES_DIR / "tcp.pcap", LINKTYPE_ETHERNET, segments, times)
+    write_pcap(SAMPLES_DIR / "mdns.pcap", LINKTYPE_ETHERNET, mdns_capture())
+    write_pcap(SAMPLES_DIR / "ssh.pcap", LINKTYPE_ETHERNET, ssh_capture())
 
 
 if __name__ == "__main__":

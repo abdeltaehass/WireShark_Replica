@@ -23,6 +23,7 @@ from pilotfish.core.dissect import (
     Handoff,
     MalformedError,
     Reader,
+    as_data,
     register,
 )
 from pilotfish.core.protocols.checksum import (
@@ -92,6 +93,9 @@ when the connection's round trip isn't known."""
 FAST_RETRANSMISSION_NS = 20_000_000
 """How soon after duplicate acknowledgements a retransmission counts as fast."""
 DUPLICATE_ACKS_BEFORE_FAST = 2
+
+RESENT = frozenset({"retransmission", "fast_retransmission", "spurious_retransmission"})
+"""The judgements that mean these bytes have been along this way before."""
 
 WINDOW_UNSEEN = -1
 """The window of a direction nothing has been seen from, which no real window
@@ -186,7 +190,7 @@ class Tcp(Dissector):
         Field("tcp.ack", FieldType.UINT, "Acknowledgment Number"),
         Field("tcp.ack_raw", FieldType.UINT, "Acknowledgment number (raw)"),
         Field("tcp.hdr_len", FieldType.UINT, "Header Length"),
-        Field("tcp.flags", FieldType.UINT, "Flags", hex=True),
+        Field("tcp.flags", FieldType.UINT, "Flags", hex=True, digits=3),
         Field("tcp.flags.res", FieldType.UINT, "Reserved"),
         Field("tcp.flags.ae", FieldType.BOOL, "Accurate ECN"),
         Field("tcp.flags.cwr", FieldType.BOOL, "Congestion Window Reduced"),
@@ -253,6 +257,7 @@ class Tcp(Dissector):
         whole = reader.buffer.peek(reader.remaining)
         source_port = reader.uint16("tcp.srcport")
         destination_port = reader.uint16("tcp.dstport")
+        context.source_port, context.destination_port = source_port, destination_port
         raw_seq = reader.uint32("tcp.seq_raw")
         raw_ack = reader.uint32("tcp.ack_raw")
 
@@ -331,6 +336,11 @@ class Tcp(Dissector):
             offset=payload.offset,
             length=payload.remaining,
         )
+        if found & RESENT:
+            # The bytes of a resent segment were carried by an earlier one, so
+            # whatever they are has been decoded already. Wireshark leaves
+            # them alone for the same reason.
+            return as_data(payload)
         return Handoff(
             TCP_PORT,
             min(source_port, destination_port),

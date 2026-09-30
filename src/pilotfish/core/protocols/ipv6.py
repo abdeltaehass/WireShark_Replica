@@ -70,10 +70,10 @@ class IPv6(Dissector):
     title = "Internet Protocol Version 6"
     fields = (
         Field("ipv6.version", FieldType.UINT, "Version"),
-        Field("ipv6.tclass", FieldType.UINT, "Traffic Class", hex=True),
+        Field("ipv6.tclass", FieldType.UINT, "Traffic Class", hex=True, digits=2),
         Field("ipv6.tclass.dscp", FieldType.UINT, "Differentiated Services Codepoint"),
         Field("ipv6.tclass.ecn", FieldType.UINT, "Explicit Congestion Notification"),
-        Field("ipv6.flow", FieldType.UINT, "Flow Label", hex=True),
+        Field("ipv6.flow", FieldType.UINT, "Flow Label", hex=True, digits=5),
         Field("ipv6.plen", FieldType.UINT, "Payload Length"),
         Field("ipv6.nxt", FieldType.UINT, "Next Header"),
         Field("ipv6.hlim", FieldType.UINT, "Hop Limit"),

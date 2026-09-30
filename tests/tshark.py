@@ -187,10 +187,13 @@ def compare(tree: ProtocolTree, expected: Fields, skip: Container[str] = ()) -> 
             node.value for node in tree.walk() if node.name == name and node.value is not None
         ]
         texts = expected[name]
-        if all(text == "" for text in texts):
-            # Wireshark can write the same flag twice for one packet, once in
-            # its analysis tree and once as expert information, so for these
-            # it is whether the flag is there that is compared.
+        if REGISTRY.fields[name].type is FieldType.BOOL and all(text == "" for text in texts):
+            # Wireshark writes a flag as an item with nothing in it, and can
+            # write the same one twice for one packet, once in its own tree
+            # and once as expert information. For flags it is therefore
+            # whether the flag is there at all that is compared. A field of
+            # any other type with nothing in it really is empty, and is
+            # compared like anything else.
             ours[name], theirs[name] = set(values), {True}
             continue
         # tshark writes a field that repeats as repeated keys of one JSON

@@ -55,7 +55,11 @@ full window, a window update, and acknowledgements of data the capture never
 saw — because real captures of a healthy network hardly ever contain them.
 The times matter as much as the sequence numbers there: whether a late segment
 counts as re-ordering or as a resend depends on how long after the other end's
-last acknowledgement it arrived. The script writes each
+last acknowledgement it arrived. `mdns.pcap` is a Bonjour question and the
+announcement that answers it, whose names are written once and pointed at
+afterwards, so it exercises the compression pointers that make DNS names
+awkward. `ssh.pcap` is a session from the greeting to the point where the
+keys change and there is nothing left to read. The script writes each
 packet field by field, and tshark decoding them in the answer keys is the
 check that they were built right.
 

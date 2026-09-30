@@ -21,22 +21,25 @@ def write_tree(tree: ProtocolTree, out: TextIO) -> None:
 
 
 def _write_node(node: Node, out: TextIO, depth: int) -> None:
-    shown = format_value(node.type, node.value, node.hex)
+    shown = format_value(node.type, node.value, node.hex, node.digits or node.length * 2)
     out.write(f"{INDENT * depth}{node.label}: {shown}\n")
     for child in node.children:
         _write_node(child, out, depth + 1)
 
 
-def format_value(field_type: FieldType, value: Value | None, in_hex: bool = False) -> str:
+def format_value(
+    field_type: FieldType, value: Value | None, in_hex: bool = False, digits: int = 0
+) -> str:
     """A field's value as the detail view shows it."""
     if value is None:
         return ""
     if field_type is FieldType.TIME and isinstance(value, int):
         return format_epoch(value)
     if in_hex and isinstance(value, int):
-        # As many digits as the value needs, in whole bytes.
-        digits = max(2, -(-value.bit_length() // 8) * 2)
-        return f"0x{value:0{digits}x}"
+        # As wide as the bytes the field was read from, as Wireshark shows it,
+        # falling back to what the value itself needs.
+        needed = max(2, -(-value.bit_length() // 8) * 2)
+        return f"0x{value:0{max(digits, needed)}x}"
     if field_type is FieldType.BOOL:
         return "Set" if value else "Not set"
     if isinstance(value, bytes):

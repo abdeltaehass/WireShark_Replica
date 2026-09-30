@@ -129,6 +129,7 @@ class Reader:
             length=parent.length if length is None else length,
             value=value,
             hex=field.hex,
+            digits=field.digits,
         )
         parent.children.append(node)
         self._last = node

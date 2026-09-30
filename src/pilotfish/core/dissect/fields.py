@@ -44,6 +44,9 @@ class Field:
     hex: bool = False
     """Whether the number reads better in hexadecimal, as a type, an
     identifier or a checksum does. Wireshark calls this the display base."""
+    digits: int = 0
+    """How many hexadecimal digits to show, for a field that doesn't fill the
+    bytes it is read from. Zero means as many as those bytes hold."""
 
     @property
     def protocol(self) -> str:

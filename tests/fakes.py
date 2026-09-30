@@ -11,8 +11,12 @@ from pilotfish.core.packet import Packet
 
 
 def fake_packet(number: int) -> Packet:
-    """Packet ``number``: an Ethernet frame stamped ``number`` seconds in."""
-    data = ethernet(ipv4(udp(1024 + number, 53)))
+    """Packet ``number``: an Ethernet frame stamped ``number`` seconds in.
+
+    It goes to a port nothing is registered for, so these tests stay about
+    capturing packets rather than about what the packets turn out to hold.
+    """
+    data = ethernet(ipv4(udp(1024 + number, 9)))
     return Packet(
         timestamp_ns=number * 1_000_000_000,
         original_length=len(data),

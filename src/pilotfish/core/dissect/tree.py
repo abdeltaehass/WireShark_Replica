@@ -29,6 +29,8 @@ class Node:
     """A layer's one-line description, such as ``Frame 1: 70 bytes captured``."""
     hex: bool = False
     """Whether to show the value in hexadecimal."""
+    digits: int = 0
+    """How many hexadecimal digits it is shown with, if not the whole bytes."""
     children: list["Node"] = field(default_factory=list)
 
     def walk(self) -> Iterator["Node"]:

@@ -311,8 +311,9 @@ class TestIcmpv6:
         original = ipv6(udp(50000, 53), next_header=17)
         tree = self.message(1, 4, bytes(4) + original)
         assert tree.info == "Destination Unreachable (Port unreachable)"
-        # This error quoted the whole datagram, so what it carried is there too.
-        assert tree.protocols[3:] == ("icmpv6", "ipv6", "udp", "data")
+        # This error quoted the whole datagram, so what it carried is decoded
+        # too, as far as the quoted bytes go.
+        assert tree.protocols[3:] == ("icmpv6", "ipv6", "udp", "dns")
         assert tree.protocol == "icmpv6"
 
 

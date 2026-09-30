@@ -11,7 +11,7 @@ import pytest
 
 import pilotfish.core.protocols  # noqa: F401  (registers the dissectors)
 import tshark
-from pilotfish.core.dissect import REGISTRY, FieldType, Session, dissect
+from pilotfish.core.dissect import REGISTRY, FieldType, ProtocolTree, Session, dissect
 from pilotfish.core.formats import CaptureFile
 
 CAPTURES = tshark.captures_with_keys()
@@ -141,8 +141,13 @@ def test_the_tcp_analysis_matches_tshark(capture: Path) -> None:
 def test_the_layers_match_tshark_as_far_as_they_go(capture: Path) -> None:
     """Every layer pilotfish decodes is the one tshark decoded there too.
 
-    tshark goes deeper, into protocols of later phases, so what pilotfish
-    found has to be the start of what tshark found rather than all of it.
+    Neither list has to reach as far as the other. tshark goes deeper, into
+    protocols of later phases. It can also stop short: a message split across
+    several packets is put back together and reported against the packet that
+    completes it, so the packet that starts one is left as plain TCP, while
+    pilotfish decodes the part it holds where it holds it. Reassembly is the
+    next phase, and it moves pilotfish's answer to the same packet as
+    Wireshark's. What neither of them may do is disagree about a layer.
     """
     expected = tshark.packets(capture)
     session = Session()
@@ -156,4 +161,64 @@ def test_the_layers_match_tshark_as_far_as_they_go(capture: Path) -> None:
             ]
             decoded = dissect(packet, number, session=session)
             ours = [name for name in decoded.protocols if name != "data"][1:]
-            assert ours == theirs[: len(ours)], f"packet {number} of {capture.name}"
+            shared = min(len(ours), len(theirs))
+            assert ours[:shared] == theirs[:shared], f"packet {number} of {capture.name}"
+
+
+# What a DNS answer can hold, by the field the value lands in.
+ANSWERS = (
+    "dns.a",
+    "dns.aaaa",
+    "dns.cname",
+    "dns.ns",
+    "dns.ptr.domain_name",
+    "dns.mx.mail_exchange",
+    "dns.srv.target",
+    "dns.txt",
+)
+
+SERVER_NAME = "tls.handshake.extensions_server_name"
+
+
+def asked_and_answered(fields: tshark.Fields | ProtocolTree) -> tuple[list[str], list[str]]:
+    """Every name asked about in a packet, and everything it was told."""
+    if isinstance(fields, ProtocolTree):
+        questions = [str(value) for value in fields.values("dns.qry.name")]
+        answers = [str(value) for name in ANSWERS for value in fields.values(name)]
+        return questions, answers
+    questions = list(fields.get("dns.qry.name", []))
+    return questions, [value for name in ANSWERS for value in fields.get(name, [])]
+
+
+@pytest.mark.parametrize("capture", CAPTURES, ids=sample_id)
+def test_every_dns_answer_and_tls_server_name_matches_tshark(capture: Path) -> None:
+    """The phase's own measure: what was asked, what came back, and who was asked for.
+
+    Every DNS question in a capture, with the answers it was given, and every
+    server name a TLS client asked for, packet by packet and in both
+    directions: a query pilotfish missed fails this as surely as one it read
+    wrongly.
+    """
+    expected = tshark.packets(capture)
+    session = Session()
+    with CaptureFile(capture) as file:
+        for number, (packet, fields) in enumerate(zip(file, expected, strict=True), start=1):
+            tree = dissect(packet, number, session=session)
+            where = f"packet {number} of {capture.name}"
+            assert asked_and_answered(tree) == asked_and_answered(fields), where
+            names = [str(value) for value in tree.values(SERVER_NAME)]
+            assert names == list(fields.get(SERVER_NAME, [])), f"{SERVER_NAME}, {where}"
+
+
+def test_the_samples_hold_dns_answers_and_tls_server_names() -> None:
+    """The comparison above is only worth having if the samples exercise it."""
+    questions = answers = names = 0
+    for capture in CAPTURES:
+        for fields in tshark.packets(capture):
+            asked, told = asked_and_answered(fields)
+            questions += len(asked)
+            answers += len(told)
+            names += len(fields.get(SERVER_NAME, []))
+    assert questions >= 40
+    assert answers >= 30
+    assert names >= 6

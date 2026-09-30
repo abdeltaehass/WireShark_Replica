@@ -9,7 +9,7 @@ from pilotfish.core.dissect.dissector import (
     Handoff,
     Registry,
 )
-from pilotfish.core.dissect.errors import MalformedError
+from pilotfish.core.dissect.errors import DeclinedError, MalformedError
 from pilotfish.core.dissect.fields import Field, FieldType
 from pilotfish.core.dissect.reader import Reader
 from pilotfish.core.dissect.session import Session
@@ -109,8 +109,18 @@ def dissect(
         quoted = context.in_error
         try:
             handoff = dissector.dissect(reader, context)
+        except DeclinedError:
+            # Not this protocol after all, so it never was a layer: what the
+            # bytes are is a question for the next phase, which can put a
+            # message back together from the packets it was split across.
+            dissector = registry.add(Data)
+            continue
         except MalformedError as error:
-            tree.error = f"{dissector.name}: {error}"
+            # A packet quoted inside an error message is only its first bytes,
+            # so running out of them is the format working as intended, not a
+            # packet that doesn't hold what it claims.
+            if not quoted:
+                tree.error = f"{dissector.name}: {error}"
             tree.layers.append(reader.node())
             _name_protocol(tree, dissector, quoted)
             break

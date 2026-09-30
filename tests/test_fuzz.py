@@ -2,7 +2,9 @@
 
 A dissector may only ever fail one way: a packet that doesn't hold what its
 headers claim raises Malformed, which the engine turns into a marked packet.
-Anything else escaping is a bug, and these tests are how it gets found.
+It may also decline a payload that isn't its protocol at all, which leaves
+the bytes as data. Anything else escaping is a bug, and these tests are how
+it gets found.
 
 The suite runs a few hundred inputs per dissector. For a longer run::
 
@@ -21,6 +23,7 @@ from pilotfish.core.dissect import (
     REGISTRY,
     Buffer,
     Context,
+    DeclinedError,
     Dissector,
     MalformedError,
     Reader,
@@ -73,9 +76,9 @@ def registered() -> list[tuple[Registry, Dissector]]:
 def test_only_malformed_escapes(registry: Registry, dissector: Dissector, data: bytes) -> None:
     packet = Packet(timestamp_ns=0, original_length=len(data), link_type=1, data=data)
     reader = Reader(dissector.protocol, Buffer(data), registry.fields)
-    # Malformed is the one failure a dissector is allowed; anything else
-    # escaping fails the test.
-    with contextlib.suppress(MalformedError):
+    # Malformed is the one failure a dissector is allowed, and declining the
+    # payload as not its own is the one refusal. Anything else escaping fails.
+    with contextlib.suppress(MalformedError, DeclinedError):
         dissector.dissect(reader, Context(packet=packet))
     # Whatever happened, the fields read so far still make a layer.
     assert reader.node().length >= 0

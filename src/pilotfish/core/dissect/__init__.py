@@ -19,10 +19,11 @@ from pilotfish.core.dissect.dissector import (
     Dissector,
     Handoff,
     Registry,
+    heuristic,
     register,
 )
 from pilotfish.core.dissect.engine import MAX_LAYERS, Data, Frame, as_data, dissect
-from pilotfish.core.dissect.errors import MalformedError
+from pilotfish.core.dissect.errors import DeclinedError, MalformedError
 from pilotfish.core.dissect.fields import Field, FieldRegistry, FieldType, Value
 from pilotfish.core.dissect.reader import Reader
 from pilotfish.core.dissect.session import Session
@@ -35,6 +36,7 @@ __all__ = [
     "Buffer",
     "Context",
     "Data",
+    "DeclinedError",
     "Dissector",
     "Field",
     "FieldRegistry",
@@ -50,5 +52,6 @@ __all__ = [
     "Value",
     "as_data",
     "dissect",
+    "heuristic",
     "register",
 ]

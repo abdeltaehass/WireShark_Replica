@@ -47,7 +47,7 @@ class IPv4(Dissector):
         Field("ip.dsfield.ecn", FieldType.UINT, "Explicit Congestion Notification"),
         Field("ip.len", FieldType.UINT, "Total Length"),
         Field("ip.id", FieldType.UINT, "Identification", hex=True),
-        Field("ip.flags", FieldType.UINT, "Flags", hex=True),
+        Field("ip.flags", FieldType.UINT, "Flags", hex=True, digits=1),
         Field("ip.flags.rb", FieldType.BOOL, "Reserved bit"),
         Field("ip.flags.df", FieldType.BOOL, "Don't fragment"),
         Field("ip.flags.mf", FieldType.BOOL, "More fragments"),

@@ -49,6 +49,7 @@ class Udp(Dissector):
         datagram = reader.buffer.peek(reader.remaining)
         source_port = reader.uint16("udp.srcport")
         destination_port = reader.uint16("udp.dstport")
+        context.source_port, context.destination_port = source_port, destination_port
         length = reader.uint16("udp.length")
         checksum = reader.uint16("udp.checksum")
         with reader.inside():

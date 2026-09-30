@@ -50,6 +50,10 @@ class Context:
     """The address the network layer gave, which a checksum over a pseudo
     header needs. ICMPv6, UDP and TCP all take their checksum over one."""
     destination: IPv4Address | IPv6Address | None = None
+    source_port: int = 0
+    """The ports the transport layer read, which name the conversation an
+    application protocol belongs to."""
+    destination_port: int = 0
     truncated: bool = False
     """Whether the capture holds less than the network header said it carries,
     which is why a checksum over the payload can't be checked."""
@@ -179,6 +183,26 @@ class Registry:
 
 REGISTRY = Registry()
 """The registry the engine uses unless it is handed another."""
+
+
+def heuristic(
+    under: str, *, registry: Registry = REGISTRY
+) -> Callable[[type[Dissector]], type[Dissector]]:
+    """Ask this dissector about payloads that no value in ``under`` claimed.
+
+    It is asked through :meth:`Dissector.looks_like`, and the first one that
+    recognises a payload decodes it::
+
+        @heuristic("tcp")
+        class Http(Dissector):
+            ...
+    """
+
+    def decorate(dissector: type[Dissector]) -> type[Dissector]:
+        registry.add_heuristic(dissector, under)
+        return dissector
+
+    return decorate
 
 
 def register(

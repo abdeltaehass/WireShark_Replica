@@ -9,6 +9,7 @@ from pilotfish.core.dissect import (
     MAX_LAYERS,
     Buffer,
     Context,
+    DeclinedError,
     Dissector,
     Field,
     FieldRegistry,
@@ -331,6 +332,20 @@ class Guessed(Dissector):
         return None
 
 
+class Picky(Dissector):
+    """A dissector that only decodes payloads it recognises."""
+
+    name = "picky"
+    title = "Picky"
+
+    def dissect(self, reader: Reader, context: Context) -> None:
+        if not bytes(reader.buffer.peek(4)).startswith(b"MINE"):
+            raise DeclinedError
+        reader.set_length(reader.remaining)
+        context.info = "picky"
+        return None
+
+
 class TestRouting:
     """How a handoff finds the dissector for what comes next."""
 
@@ -377,6 +392,21 @@ class TestRouting:
         # Registering the same one again doesn't ask it twice.
         registry.add_heuristic(Guessed, PORTS)
         assert len(registry.heuristics(PORTS)) == 2
+
+    def test_a_dissector_that_declines_leaves_the_bytes_as_data(self) -> None:
+        # A port says what a payload usually holds, not what it always holds.
+        registry = self.registry()
+        registry.add(Picky, PORTS, (53,))
+        tree = self.decode(registry, (50000, 53), b"NOPE not this protocol")
+        assert tree.protocols == ("frame", "transport", "data")
+        assert tree.get("data.data") == b"NOPE not this protocol"
+
+    def test_the_same_dissector_decodes_what_it_does_recognise(self) -> None:
+        registry = self.registry()
+        registry.add(Picky, PORTS, (53,))
+        tree = self.decode(registry, (50000, 53), b"MINE after all")
+        assert tree.protocols == ("frame", "transport", "picky")
+        assert tree.info == "picky"
 
     def test_a_table_with_no_heuristics_has_nothing_to_ask(self) -> None:
         assert self.registry().heuristics(PORTS) == ()
