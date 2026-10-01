@@ -44,6 +44,10 @@ class Conversations[T]:
             self._conversations[key] = conversation
         return conversation, source == conversation.initiator
 
+    def get(self, source: Endpoint, destination: Endpoint) -> Conversation[T] | None:
+        """The conversation between these ends, if the capture has met it."""
+        return self._conversations.get(frozenset({source, destination}))
+
     def __len__(self) -> int:
         return len(self._conversations)
 

@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from pilotfish import __version__
-from pilotfish.cli import capture, fields, interfaces, read
+from pilotfish.cli import capture, fields, follow, interfaces, read
 from pilotfish.cli.table import TIME_FORMATS
 from pilotfish.core.capture import DEFAULT_QUEUE_SIZE, MAX_SNAPLEN, CaptureOptions
 
@@ -18,6 +18,13 @@ def _positive_int(text: str) -> int:
     value = int(text)
     if value < 1:
         raise argparse.ArgumentTypeError(f"must be at least 1, not {value}")
+    return value
+
+
+def _stream_number(text: str) -> int:
+    value = int(text)
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"must be 0 or more, not {value}")
     return value
 
 
@@ -142,6 +149,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_time_format(capture_parser)
 
+    follow_parser = commands.add_parser(
+        "follow",
+        help="print one TCP connection as the conversation it carried",
+        description="Put one TCP connection's bytes back in the order they were "
+        "sent and print what each end said. `pilotfish read -V` shows each "
+        "packet's stream number as its stream index.",
+    )
+    follow_parser.add_argument("file", type=Path, help="capture file to read")
+    follow_parser.add_argument(
+        "stream", type=_stream_number, help="number of the TCP stream to follow, counting from 0"
+    )
+    follow_parser.add_argument(
+        "--raw",
+        choices=follow.SIDES,
+        help="write only the bytes this end sent, exactly as it sent them, "
+        "to save to a file or pipe into a hash",
+    )
+
     commands.add_parser(
         "fields",
         help="list the fields pilotfish can decode",
@@ -182,6 +207,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 queue_size=args.queue_size,
                 print_filter=args.print_filter,
             )
+        if args.command == "follow":
+            return follow.run(args.file, args.stream, raw=args.raw)
         if args.command == "fields":
             return fields.run()
         if args.command == "interfaces":

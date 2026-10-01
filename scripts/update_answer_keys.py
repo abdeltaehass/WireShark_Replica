@@ -29,7 +29,9 @@ TSHARK_FILTER = "not frame.cb_pen"
 CAPINFOS_FLAGS = ("-T", "-M", "-c", "-a", "-e", "-S")
 
 # Wireshark leaves checksums unchecked unless it is asked, and the dissector
-# tests compare pilotfish's checksum flags with its.
+# tests compare pilotfish's checksum flags with its. It also hands a segment
+# that arrives ahead of a gap straight to the next protocol unless it is asked
+# to wait for the gap to fill, which pilotfish always does.
 TSHARK_PREFERENCES = (
     "-o",
     "ip.check_checksum:TRUE",
@@ -37,6 +39,8 @@ TSHARK_PREFERENCES = (
     "udp.check_checksum:TRUE",
     "-o",
     "tcp.check_checksum:TRUE",
+    "-o",
+    "tcp.reassemble_out_of_order:TRUE",
 )
 
 # The dissector tests compare against every field tshark decodes. That output

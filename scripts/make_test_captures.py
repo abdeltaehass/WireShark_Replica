@@ -13,6 +13,8 @@ Then record the answer keys:
     uv run scripts/update_answer_keys.py samples/made/*.pcap
 """
 
+import gzip
+import hashlib
 import struct
 import sys
 from ipaddress import IPv4Address, IPv6Address
@@ -143,8 +145,24 @@ def fragment_header(
     return struct.pack(">BBHI", payload_next, 0, offset << 3 | int(more), identifier)
 
 
-def udp(payload: bytes, *, source_port: int = 50000, destination_port: int = 53) -> bytes:
-    return struct.pack(">HHHH", source_port, destination_port, 8 + len(payload), 0) + payload
+def udp(
+    payload: bytes,
+    *,
+    source_port: int = 50000,
+    destination_port: int = 53,
+    between: tuple[str, str] | None = None,
+) -> bytes:
+    """A UDP datagram, checksummed when it is told the addresses it goes
+    ``between``. Over IPv4 a checksum of zero means there isn't one."""
+    datagram = struct.pack(">HHHH", source_port, destination_port, 8 + len(payload), 0) + payload
+    if between is None:
+        return datagram
+    pseudo = (
+        IPv4Address(between[0]).packed
+        + IPv4Address(between[1]).packed
+        + struct.pack(">BBH", 0, PROTO_UDP, len(datagram))
+    )
+    return datagram[:6] + struct.pack(">H", checksum(pseudo + datagram)) + datagram[8:]
 
 
 def icmp(kind: int, code: int, rest: bytes, *, break_checksum: bool = False) -> bytes:
@@ -749,13 +767,11 @@ def tls_extension(kind: int, body: bytes) -> bytes:
     return struct.pack(">HH", kind, len(body)) + body
 
 
-def tls_capture() -> list[bytes]:
-    """A handshake up to the point where it turns to noise.
+def tls_client_hello() -> bytes:
+    """The record a client opens with: what it will accept, and who it wants.
 
-    A client says which versions and ciphers it will accept and, in the clear,
-    which server it is asking for; the server picks; and everything after that
-    is encrypted. The lists here are a real macOS client's, including one of
-    the reserved values a client throws in to keep servers honest.
+    The lists here are a real macOS client's, including one of the reserved
+    values a client throws in to keep servers honest.
     """
     name = b"example.com"
     server_name = tls_extension(0, struct.pack(">HBH", len(name) + 3, 0, len(name)) + name)
@@ -774,8 +790,18 @@ def tls_capture() -> list[bytes]:
     hello += bytes([1, 0])
     extensions = server_name + alpn + versions + groups + formats + signatures + key_share
     hello += struct.pack(">H", len(extensions)) + extensions
-    client_hello = tls_record(22, tls_handshake(1, hello), version=0x0301)
+    return tls_record(22, tls_handshake(1, hello), version=0x0301)
 
+
+def tls_capture() -> list[bytes]:
+    """A handshake up to the point where it turns to noise.
+
+    A client says which versions and ciphers it will accept and, in the clear,
+    which server it is asking for; the server picks; and everything after that
+    is encrypted.
+    """
+    client_hello = tls_client_hello()
+    share = bytes(range(32))
     answered = struct.pack(">H", 0x0303) + bytes(range(32, 64)) + bytes([32]) + bytes(range(32))
     answered += struct.pack(">HB", 0x1301, 0)
     chosen = tls_extension(43, struct.pack(">H", 0x0304)) + tls_extension(
@@ -816,6 +842,324 @@ def tls_capture() -> list[bytes]:
     ]
 
 
+FRAGMENT_SIZE = 1480
+"""What fits in a 1500-byte Ethernet frame after an IPv4 header, and a
+multiple of eight, as every fragment but the last has to be."""
+
+
+def ipv4_fragments(
+    datagram: bytes,
+    protocol: int,
+    *,
+    identifier: int,
+    source: str = "192.0.2.1",
+    destination: str = "192.0.2.2",
+    size: int = FRAGMENT_SIZE,
+) -> list[bytes]:
+    """One IPv4 datagram as the fragments a router would cut it into."""
+    from_client = source == "192.0.2.1"
+    return [
+        ethernet(
+            ipv4(
+                datagram[offset : offset + size],
+                protocol,
+                source=source,
+                destination=destination,
+                identifier=identifier,
+                flags=0b001 if offset + size < len(datagram) else 0,
+                fragment_offset=offset // 8,
+            ),
+            ETHERTYPE_IPV4,
+            source=CLIENT_MAC if from_client else SERVER_MAC,
+            destination=SERVER_MAC if from_client else CLIENT_MAC,
+        )
+        for offset in range(0, len(datagram), size)
+    ]
+
+
+def ipv6_fragments(
+    datagram: bytes,
+    next_header: int,
+    *,
+    identifier: int,
+    source: str = "2001:db8::1",
+    destination: str = "2001:db8::2",
+    size: int = 1232,
+) -> list[bytes]:
+    """The same for IPv6, where each piece carries a fragment header."""
+    return [
+        ethernet(
+            ipv6(
+                fragment_header(
+                    next_header,
+                    offset=offset // 8,
+                    more=offset + size < len(datagram),
+                    identifier=identifier,
+                )
+                + datagram[offset : offset + size],
+                PROTO_IPV6_FRAGMENT,
+                source=source,
+                destination=destination,
+            ),
+            ETHERTYPE_IPV6,
+        )
+        for offset in range(0, len(datagram), size)
+    ]
+
+
+def fragments_capture() -> list[bytes]:
+    """Datagrams too big for one frame, arriving the ways fragments do.
+
+    In order, backwards, with a piece sent twice, and with a piece that
+    never comes. Each whole datagram carries a checksum over all of it, so
+    decoding it at all proves the pieces were put back where they belong.
+    """
+    filler = bytes(range(256)) * 12
+    request = icmp_echo(8, identifier=0x0F0F, sequence=1, payload=filler[:3000])
+    reply = icmp_echo(0, identifier=0x0F0F, sequence=1, payload=filler[:3000])
+    ends = ("192.0.2.1", "192.0.2.2")
+    datagram = udp(filler[:2000], source_port=50020, destination_port=50021, between=ends)
+    twice = ipv4_fragments(datagram, PROTO_UDP, identifier=0x0303)
+    lost = ipv4_fragments(udp(filler[:2500]), PROTO_UDP, identifier=0x0404)
+
+    echo = icmpv6(128, 0, struct.pack(">HH", 0x0F0F, 1) + filler[:2000])
+    answer = icmpv6(
+        129,
+        0,
+        struct.pack(">HH", 0x0F0F, 1) + filler[:2000],
+        source="2001:db8::2",
+        destination="2001:db8::1",
+    )
+    return [
+        # In the order they were cut.
+        *ipv4_fragments(request, PROTO_ICMP, identifier=0x0101),
+        # Last piece first, as a path that re-orders packets delivers them.
+        *reversed(
+            ipv4_fragments(
+                reply, PROTO_ICMP, identifier=0x0202, source="192.0.2.2", destination="192.0.2.1"
+            )
+        ),
+        # The first piece arrives twice before the second arrives at all.
+        twice[0],
+        twice[0],
+        twice[1],
+        # A first piece whose second never turns up, so it stays a fragment.
+        lost[0],
+        # The same two ways round again, over IPv6.
+        *ipv6_fragments(echo, PROTO_IPV6_ICMP, identifier=0xF00D0001),
+        *reversed(
+            ipv6_fragments(
+                answer,
+                PROTO_IPV6_ICMP,
+                identifier=0xF00D0002,
+                source="2001:db8::2",
+                destination="2001:db8::1",
+            )
+        ),
+    ]
+
+
+MSS = 1460
+"""The most a segment carries over Ethernet: 1500 less two 20-byte headers."""
+
+
+class Connection:
+    """Both ends of one TCP connection, keeping count of what each has sent.
+
+    Building a segment doesn't put it in the capture. The caller does that,
+    which is how a segment gets to arrive late, twice, or not at all.
+    """
+
+    def __init__(self, client_port: int, server_port: int, client_isn: int, server_isn: int):
+        self.client_port = client_port
+        self.server_port = server_port
+        self.next = {True: client_isn, False: server_isn}
+
+    def segment(self, flags: int, payload: bytes = b"", *, from_client: bool) -> bytes:
+        """The next segment from one end, acknowledging all the other has sent."""
+        acknowledgement = self.next[not from_client] if flags & ACK else 0
+        frame = tcp(
+            self.next[from_client],
+            acknowledgement,
+            flags,
+            payload=payload,
+            from_client=from_client,
+            client_port=self.client_port,
+            server_port=self.server_port,
+        )
+        self.next[from_client] += len(payload) + (1 if flags & (SYN | FIN) else 0)
+        return frame
+
+    def handshake(self) -> list[bytes]:
+        return [
+            self.segment(SYN, from_client=True),
+            self.segment(SYN | ACK, from_client=False),
+            self.segment(ACK, from_client=True),
+        ]
+
+    def send(self, data: bytes, *, from_client: bool, size: int = MSS) -> list[bytes]:
+        """``data`` cut into segments, the last of them pushed."""
+        pieces = [data[at : at + size] for at in range(0, len(data), size)]
+        return [
+            self.segment(
+                ACK | (PUSH if number == len(pieces) - 1 else 0), piece, from_client=from_client
+            )
+            for number, piece in enumerate(pieces)
+        ]
+
+    def acknowledge(self, *, from_client: bool) -> bytes:
+        return self.segment(ACK, from_client=from_client)
+
+    def close(self, *, first: bool) -> list[bytes]:
+        """Each end says it has finished, ``first`` going first."""
+        return [
+            self.segment(FIN | ACK, from_client=first),
+            self.segment(FIN | ACK, from_client=not first),
+            self.segment(ACK, from_client=first),
+        ]
+
+
+DOWNLOAD_SIZE = 20000
+
+
+def download_file() -> bytes:
+    """The file the download capture carries: 20,000 bytes that look random
+    and are the same every time, so the test that rebuilds the file from the
+    capture knows what it should get."""
+    blocks = (hashlib.sha256(number.to_bytes(4, "big")).digest() for number in range(625))
+    return b"".join(blocks)
+
+
+def chunked(body: bytes, size: int) -> bytes:
+    """A body as HTTP sends it in chunks: each with its length in front, in
+    hexadecimal, and a chunk of no length to finish."""
+    pieces = [body[at : at + size] for at in range(0, len(body), size)]
+    return b"".join(b"%x\r\n%s\r\n" % (len(piece), piece) for piece in pieces) + b"0\r\n\r\n"
+
+
+def http_download_capture() -> list[bytes]:
+    """A file fetched over HTTP, and the three ways a body says where it ends.
+
+    The download is the point: a response far bigger than one segment, whose
+    segments don't all arrive in order. Following the server's side of the
+    stream has to give back the file exactly.
+
+    After it, on the same connection, comes a body sent compressed and in
+    chunks, and on a second connection a body with no length at all, which
+    ends when the server hangs up.
+    """
+    file = download_file()
+    assert len(file) == DOWNLOAD_SIZE
+    first = Connection(50010, SERVER_PORT, 10_000, 50_000)
+    packets = first.handshake()
+    request = b"GET /pilotfish.bin HTTP/1.1\r\nHost: example.com\r\nAccept: */*\r\n\r\n"
+    packets += first.send(request, from_client=True)
+    packets.append(first.acknowledge(from_client=False))
+    head = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Server: pilotfish\r\n"
+        b"Content-Type: application/octet-stream\r\n"
+        b"Content-Length: %d\r\n"
+        b"\r\n" % len(file)
+    )
+    segments = first.send(head + file, from_client=False)
+    # The fourth segment overtakes the third, as happens when the two take
+    # different paths. Until the third arrives there is a hole in the file.
+    segments[2], segments[3] = segments[3], segments[2]
+    packets += segments
+    packets.append(first.acknowledge(from_client=True))
+    # The server never heard that its last segment arrived, and sends it again.
+    packets.append(segments[-1])
+    packets.append(first.acknowledge(from_client=True))
+
+    notes = b"".join(b"Line %03d of the notes.\n" % number for number in range(1, 121))
+    packets += first.send(
+        b"GET /notes.txt HTTP/1.1\r\nHost: example.com\r\nAccept-Encoding: gzip\r\n\r\n",
+        from_client=True,
+    )
+    packed = gzip.compress(notes, mtime=0)
+    answer = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Server: pilotfish\r\n"
+        b"Content-Type: text/plain\r\n"
+        b"Content-Encoding: gzip\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"\r\n"
+    ) + chunked(packed, 100)
+    # Cut where no chunk ends, so a size and its chunk land in different
+    # segments.
+    packets += first.send(answer, from_client=False, size=173)
+    packets.append(first.acknowledge(from_client=True))
+    packets += first.close(first=True)
+
+    second = Connection(50011, SERVER_PORT, 20_000, 60_000)
+    packets += second.handshake()
+    packets += second.send(b"GET /old.txt HTTP/1.0\r\nHost: example.com\r\n\r\n", from_client=True)
+    old = b"HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\n\r\n" + b"".join(
+        b"An older server sends line %02d and says nothing of how many follow.\n" % number
+        for number in range(1, 41)
+    )
+    packets += second.send(old, from_client=False)
+    packets.append(second.acknowledge(from_client=True))
+    # Hanging up is the only thing that says the body is over.
+    packets += second.close(first=False)
+    return packets
+
+
+def segments_capture() -> list[bytes]:
+    """Messages that TCP cut wherever a segment happened to end.
+
+    A TLS server's records, cut inside a record, inside a record's header,
+    and between records, and then an SSH key exchange message that takes two
+    segments to arrive. Each message has to be decoded once, whole, in the
+    packet that brings the last of it.
+    """
+    share = bytes(range(32))
+    chosen = tls_extension(43, struct.pack(">H", 0x0304)) + tls_extension(
+        51, struct.pack(">HH", 0x001D, len(share)) + share
+    )
+    hello = struct.pack(">H", 0x0303) + bytes(range(32, 64)) + bytes([32]) + bytes(range(32))
+    hello += struct.pack(">HB", 0x1301, 0) + struct.pack(">H", len(chosen)) + chosen
+    records = [
+        tls_record(22, tls_handshake(2, hello)),
+        tls_record(20, bytes([1])),
+        tls_record(23, bytes(range(256)) * 5),
+        tls_record(23, bytes(range(255, -1, -1)) * 12),
+        tls_record(23, bytes(range(64))),
+        tls_record(23, bytes(range(200))),
+    ]
+    flight = b"".join(records)
+    third = len(records[0]) + len(records[1])
+    fourth = third + len(records[2])
+    cuts = [
+        100,  # inside the ServerHello
+        third + 3,  # three bytes into a record's header
+        fourth,  # exactly where one record ends and the next begins
+        fourth + MSS,
+        fourth + 2 * MSS,
+        len(flight) - 150,  # the end of one record, a whole one, the start of another
+        len(flight),
+    ]
+    tls = Connection(50012, TLS_PORT, 30_000, 70_000)
+    packets = tls.handshake()
+    packets += tls.send(tls_client_hello(), from_client=True)
+    at = 0
+    for cut in cuts:
+        packets += tls.send(flight[at:cut], from_client=False)
+        at = cut
+    packets.append(tls.acknowledge(from_client=True))
+
+    ssh = Connection(50013, SSH_PORT, 40_000, 80_000)
+    packets += ssh.handshake()
+    packets += ssh.send(b"SSH-2.0-OpenSSH_9.6\r\n", from_client=True)
+    packets += ssh.send(b"SSH-2.0-OpenSSH_9.6p1 Debian-3\r\n", from_client=False)
+    # A real client offers enough algorithms that the list outgrows a segment.
+    packets += ssh.send(kexinit(from_client=True), from_client=True, size=200)
+    packets += ssh.send(kexinit(from_client=False), from_client=False)
+    packets.append(ssh.acknowledge(from_client=True))
+    return packets
+
+
 def main() -> None:
     SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
     write_pcap(SAMPLES_DIR / "vlan.pcap", LINKTYPE_ETHERNET, vlan_capture())
@@ -828,6 +1172,18 @@ def main() -> None:
     write_pcap(SAMPLES_DIR / "mdns.pcap", LINKTYPE_ETHERNET, mdns_capture())
     write_pcap(SAMPLES_DIR / "ssh.pcap", LINKTYPE_ETHERNET, ssh_capture())
     write_pcap(SAMPLES_DIR / "tls.pcap", LINKTYPE_ETHERNET, tls_capture())
+    write_pcap(SAMPLES_DIR / "fragments.pcap", LINKTYPE_ETHERNET, fragments_capture())
+    for name, packets in (
+        ("http-download.pcap", http_download_capture()),
+        ("segments.pcap", segments_capture()),
+    ):
+        # A millisecond apart, as packets on a local network are, which is
+        # what makes a segment that arrives late count as re-ordered rather
+        # than as sent again.
+        times = [number / 1000 for number in range(len(packets))]
+        write_pcap(SAMPLES_DIR / name, LINKTYPE_ETHERNET, packets, times)
+    digest = hashlib.sha256(download_file()).hexdigest()
+    print(f"http-download.pcap carries a file whose SHA-256 is {digest}")
 
 
 if __name__ == "__main__":

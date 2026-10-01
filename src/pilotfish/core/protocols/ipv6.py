@@ -9,17 +9,25 @@ References: RFC 8200, and RFC 2460 for the routing header.
 
 from pilotfish.core.dissect import (
     LINK_TYPE,
+    Buffer,
     Context,
     Dissector,
     Field,
     FieldType,
     Handoff,
     Reader,
+    Source,
     as_data,
     register,
 )
 from pilotfish.core.protocols.ethernet import ETHERTYPE, ETHERTYPE_IPV6
-from pilotfish.core.protocols.ip import IP_PROTO, IP_VERSION, LINKTYPE_IPV6, cut_short
+from pilotfish.core.protocols.ip import (
+    IP_PROTO,
+    IP_VERSION,
+    LINKTYPE_IPV6,
+    cut_short,
+    reassemble,
+)
 from pilotfish.core.protocols.loopback import (
     AF_INET6_BSD,
     AF_INET6_DARWIN,
@@ -193,6 +201,16 @@ class Fragment(Dissector):
         Field("ipv6.fraghdr.reserved_bits", FieldType.UINT, "Reserved bits"),
         Field("ipv6.fraghdr.more", FieldType.BOOL, "More Fragments"),
         Field("ipv6.fraghdr.ident", FieldType.UINT, "Identification", hex=True),
+        Field("ipv6.fragment", FieldType.UINT, "IPv6 Fragment"),
+        Field("ipv6.fragment.count", FieldType.UINT, "Fragment count"),
+        Field("ipv6.fragment.overlap", FieldType.BOOL, "Fragment overlap"),
+        Field(
+            "ipv6.fragment.overlap.conflict",
+            FieldType.BOOL,
+            "Conflicting data in fragment overlap",
+        ),
+        Field("ipv6.reassembled.length", FieldType.UINT, "Reassembled IPv6 length"),
+        Field("ipv6.reassembled.data", FieldType.BYTES, "Reassembled IPv6 data"),
     )
 
     def dissect(self, reader: Reader, context: Context) -> Handoff | None:
@@ -203,16 +221,37 @@ class Fragment(Dissector):
         reader.add("ipv6.fraghdr.offset", word >> 3, offset=offset, length=2)
         reader.add("ipv6.fraghdr.reserved_bits", (word >> 1) & 0x3, offset=offset, length=2)
         reader.add("ipv6.fraghdr.more", bool(word & 1), offset=offset, length=2)
-        reader.uint32("ipv6.fraghdr.ident")
+        identifier = reader.uint32("ipv6.fraghdr.ident")
         reader.summarize(self.title)
         payload = reader.payload()
-        if not payload.remaining:
+        fragment_offset, more = (word >> 3) * 8, bool(word & 1)
+        if not (fragment_offset or more):
+            # A fragment header on a datagram that was never cut up.
+            return Handoff(IP_PROTO, next_header, payload) if payload.remaining else None
+        # Only the pieces after this header are put together. The headers
+        # before it are repeated in every fragment.
+        key = (context.source, context.destination, identifier)
+        whole = reassemble(context, payload, key, fragment_offset, more)
+        if whole is None:
+            context.describe(
+                f"IPv6 fragment (off={fragment_offset} more={'y' if more else 'n'} "
+                f"ident=0x{identifier:08x} nxt={next_header})"
+            )
+            return as_data(payload) if payload.remaining else None
+        for frame in whole.frames:
+            reader.add("ipv6.fragment", frame)
+        if whole.overlap:
+            reader.add("ipv6.fragment.overlap", True)
+        if whole.conflict:
+            reader.add("ipv6.fragment.overlap.conflict", True)
+        reader.add("ipv6.fragment.count", len(whole.frames))
+        reader.add("ipv6.reassembled.length", len(whole.data))
+        reader.add("ipv6.reassembled.data", whole.data)
+        if not whole.data:
             return None
-        if word >> 3 or word & 1:
-            # A piece of a datagram holds only part of a message, and
-            # putting them back together comes in a later phase.
-            return as_data(payload)
-        return Handoff(IP_PROTO, next_header, payload)
+        return Handoff(
+            IP_PROTO, next_header, Buffer(whole.data, 0, Source("Reassembled IPv6", whole.data))
+        )
 
 
 def read_options(reader: Reader, end: int) -> None:

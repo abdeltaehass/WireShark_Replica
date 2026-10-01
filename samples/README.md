@@ -60,9 +60,27 @@ announcement that answers it, whose names are written once and pointed at
 afterwards, so it exercises the compression pointers that make DNS names
 awkward. `ssh.pcap` is a session from the greeting to the point where the
 keys change and there is nothing left to read, and `tls.pcap` is a handshake
-up to the same point, carrying the server name a client asks for in the clear. The script writes each
-packet field by field, and tshark decoding them in the answer keys is the
-check that they were built right.
+up to the same point, carrying the server name a client asks for in the clear.
+
+Three more are for messages that don't fit in one packet. `fragments.pcap` is
+datagrams cut into IPv4 and IPv6 fragments that arrive in order, backwards,
+with a piece sent twice, and with a piece that never comes. `segments.pcap`
+is a TLS server's records cut wherever a segment happened to end — inside a
+record, inside a record's header, and between records — followed by an SSH
+key exchange message that takes two segments. `http-download.pcap` is a
+20,000-byte file fetched over HTTP, whose fourth segment overtakes its third
+and whose last is sent twice, then a body sent compressed and in chunks, and
+on a second connection a body with no length at all, which ends when the
+server hangs up. The file is the SHA-256 digests of the numbers 0 to 624,
+one after another, and its own SHA-256 is
+
+    4cfd36429b493d7232195a49be8270f51031a8bcc0878052b4c753eff45b9b85
+
+which is what `tests/test_follow.py` expects to get back from following the
+stream.
+
+The script writes each packet field by field, and tshark decoding them in the
+answer keys is the check that they were built right.
 
 ### `private/`
 

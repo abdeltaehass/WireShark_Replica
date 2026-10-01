@@ -101,13 +101,14 @@ def ipv4(
     flags: int = 0b010,
     source: str = "192.0.2.1",
     destination: str = "192.0.2.2",
+    identifier: int = 1,
     break_checksum: bool = False,
 ) -> bytes:
     """An IPv4 header, with ``options`` after the fixed part."""
     assert len(options) % 4 == 0
     words = 5 + len(options) // 4
     header = bytes([0x40 | words, 0]) + (20 + len(options) + len(payload)).to_bytes(2, "big")
-    header += b"\x00\x01" + (flags << 13 | fragment_offset).to_bytes(2, "big")
+    header += identifier.to_bytes(2, "big") + (flags << 13 | fragment_offset).to_bytes(2, "big")
     header += bytes([64, protocol]) + b"\x00\x00"
     header += IPv4Address(source).packed + IPv4Address(destination).packed
     whole = header + options

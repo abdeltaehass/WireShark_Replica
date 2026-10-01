@@ -38,6 +38,22 @@ TSHARK_FILTER = "not frame.cb_pen"
 type Fields = dict[str, list[str]]
 """One packet's fields, by name. A field can appear more than once."""
 
+AT_LEAST_AS_OFTEN = frozenset({"tls.stream", "tcp.segment"})
+"""Fields tshark reports more often than pilotfish, for reasons of its own.
+
+tshark starts a TLS layer for the first bytes of a record that isn't all
+there, and when it turns out it has to wait, the layer stays in the tree
+holding nothing but its stream number. It also counts a segment that was sent
+twice among the segments of the message it repeats part of. pilotfish adds no
+layer until there is a record to put in it, and lists the segments a
+message's bytes came from. So for these, every value pilotfish reports has to
+be one tshark reports, and it may not report more of them.
+"""
+
+SEGMENT_COUNT = "tcp.segment.count"
+"""How many segments a message came from, which for the same reason can be
+fewer for pilotfish than for tshark, and never more."""
+
 
 def answer_key(capture: Path) -> Path:
     return capture.with_name(f"{capture.name}.tshark.json.gz")
@@ -90,6 +106,7 @@ def run_tshark(capture: Path) -> str:
             *["-o", "ip.check_checksum:TRUE"],
             *["-o", "udp.check_checksum:TRUE"],
             *["-o", "tcp.check_checksum:TRUE"],
+            *["-o", "tcp.reassemble_out_of_order:TRUE"],
         ],
         cwd=capture.parent,
         capture_output=True,
@@ -172,8 +189,8 @@ def compare(tree: ProtocolTree, expected: Fields, skip: Container[str] = ()) -> 
     """Check every field pilotfish decoded that tshark decoded as well.
 
     Fields tshark reports and pilotfish doesn't are left alone: they belong to
-    protocols of a later phase, or are values Wireshark works out rather than
-    reads. Anything pilotfish claims, though, has to agree.
+    protocols pilotfish doesn't decode, or are values Wireshark works out
+    rather than reads. Anything pilotfish claims, though, has to agree.
     """
     names = {
         node.name
@@ -196,10 +213,24 @@ def compare(tree: ProtocolTree, expected: Fields, skip: Container[str] = ()) -> 
             # compared like anything else.
             ours[name], theirs[name] = set(values), {True}
             continue
+        reported = [as_value(REGISTRY.fields[name], text) for text in texts]
+        if name in AT_LEAST_AS_OFTEN:
+            assert len(values) <= len(reported), name
+            assert set(values) <= set(reported), name
+            continue
+        if name == SEGMENT_COUNT:
+            assert len(values) == len(reported), name
+            assert all(
+                isinstance(mine, int) and isinstance(its, int) and 0 < mine <= its
+                for mine, its in zip(
+                    sorted(values, key=repr), sorted(reported, key=repr), strict=True
+                )
+            ), name
+            continue
         # tshark writes a field that repeats as repeated keys of one JSON
         # object, and merging those gathers them all where the first one was,
         # which loses the order they came in. So for these it is the values
         # and how many of each that are compared, not the order.
         ours[name] = sorted(values, key=repr)
-        theirs[name] = sorted((as_value(REGISTRY.fields[name], text) for text in texts), key=repr)
+        theirs[name] = sorted(reported, key=repr)
     assert ours == theirs

@@ -1,10 +1,18 @@
 """IPv4: addresses, fragmentation, and a checksum over the header.
 
+A datagram too big for a link is cut into fragments, and only the first of
+them starts with the header of what it carries. So a fragment is kept until
+the rest have arrived, and the packet that brings the last of them is the one
+the whole datagram is decoded in.
+
 Reference: RFC 791.
 """
 
+from ipaddress import IPv4Address
+
 from pilotfish.core.dissect import (
     LINK_TYPE,
+    Buffer,
     Context,
     Dissector,
     Field,
@@ -12,12 +20,19 @@ from pilotfish.core.dissect import (
     Handoff,
     MalformedError,
     Reader,
+    Source,
     as_data,
     register,
 )
 from pilotfish.core.protocols.checksum import ChecksumStatus, verify
 from pilotfish.core.protocols.ethernet import ETHERTYPE, ETHERTYPE_IPV4
-from pilotfish.core.protocols.ip import IP_PROTO, IP_VERSION, LINKTYPE_IPV4, cut_short
+from pilotfish.core.protocols.ip import (
+    IP_PROTO,
+    IP_VERSION,
+    LINKTYPE_IPV4,
+    cut_short,
+    reassemble,
+)
 from pilotfish.core.protocols.loopback import AF_INET, NULL_FAMILY
 
 HEADER_SIZE = 20
@@ -63,6 +78,16 @@ class IPv4(Dissector):
         Field("ip.opt.type.class", FieldType.UINT, "Class"),
         Field("ip.opt.type.number", FieldType.UINT, "Number"),
         Field("ip.opt.len", FieldType.UINT, "Length"),
+        Field("ip.fragment", FieldType.UINT, "IPv4 Fragment"),
+        Field("ip.fragment.count", FieldType.UINT, "Fragment count"),
+        Field("ip.fragment.overlap", FieldType.BOOL, "Fragment overlap"),
+        Field(
+            "ip.fragment.overlap.conflict",
+            FieldType.BOOL,
+            "Conflicting data in fragment overlap",
+        ),
+        Field("ip.reassembled.length", FieldType.UINT, "Reassembled IPv4 length"),
+        Field("ip.reassembled.data", FieldType.BYTES, "Reassembled IPv4 data"),
     )
 
     def dissect(self, reader: Reader, context: Context) -> Handoff | None:
@@ -118,15 +143,51 @@ class IPv4(Dissector):
         declared = max(total_length - header_length, 0)
         payload = reader.payload(declared)
         context.truncated = cut_short(payload, declared, context.packet)
-        if fragment_offset or flags & FLAG_MORE_FRAGMENTS:
-            # Only the first fragment starts with the header of what follows,
-            # and even that is only half a message. Reassembly comes later.
+        if not (fragment_offset or flags & FLAG_MORE_FRAGMENTS):
+            return Handoff(IP_PROTO, protocol, payload)
+        whole = None
+        # A header that doesn't add up can't be trusted to say which datagram
+        # a fragment belongs to, so only sound ones are put together.
+        if status is ChecksumStatus.GOOD:
+            whole = self._reassemble(
+                reader,
+                context,
+                payload,
+                (source, destination, protocol, identifier),
+                fragment_offset * 8,
+                bool(flags & FLAG_MORE_FRAGMENTS),
+            )
+        if whole is None:
             context.describe(
                 f"Fragmented IP protocol (proto={protocol}, "
                 f"off={fragment_offset * 8}, ID={identifier:04x})"
             )
             return as_data(payload) if payload.remaining else None
-        return Handoff(IP_PROTO, protocol, payload)
+        return Handoff(IP_PROTO, protocol, whole)
+
+    @staticmethod
+    def _reassemble(
+        reader: Reader,
+        context: Context,
+        payload: Buffer,
+        key: tuple[IPv4Address, IPv4Address, int, int],
+        offset: int,
+        more: bool,
+    ) -> Buffer | None:
+        """The whole datagram, if this fragment is the one that completes it."""
+        whole = reassemble(context, payload, key, offset, more)
+        if whole is None:
+            return None
+        for frame in whole.frames:
+            reader.add("ip.fragment", frame)
+        if whole.overlap:
+            reader.add("ip.fragment.overlap", True)
+        if whole.conflict:
+            reader.add("ip.fragment.overlap.conflict", True)
+        reader.add("ip.fragment.count", len(whole.frames))
+        reader.add("ip.reassembled.length", len(whole.data))
+        reader.add("ip.reassembled.data", whole.data)
+        return Buffer(whole.data, 0, Source("Reassembled IPv4", whole.data))
 
     def _options(self, reader: Reader, count: int) -> None:
         """The options after the fixed header, up to ``count`` bytes of them."""

@@ -1,8 +1,23 @@
 """A bounds-checked view of a packet's bytes."""
 
 from collections.abc import Buffer as BytesLike
+from dataclasses import dataclass
 
 from pilotfish.core.dissect.errors import MalformedError
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class Source:
+    """Bytes that aren't in the packet being decoded.
+
+    A message put back together from several packets is in none of them, so
+    the fields decoded from it point into these bytes instead, the way
+    Wireshark opens a second tab beside the frame's own bytes.
+    """
+
+    name: str
+    """What the bytes are, such as ``Reassembled TCP``."""
+    data: bytes
 
 
 class Buffer:
@@ -16,14 +31,18 @@ class Buffer:
     a later part of it, so a field always knows where its bytes are in the
     packet. Reading copies nothing: the bytes stay in the capture file's
     mapping or the capture thread's buffer until a dissector asks for them.
+
+    A buffer over reassembled bytes names them as its ``source``, and its
+    offsets count from the first of those instead.
     """
 
-    __slots__ = ("_position", "_start", "_view")
+    __slots__ = ("_position", "_start", "_view", "source")
 
-    def __init__(self, data: BytesLike, start: int = 0) -> None:
+    def __init__(self, data: BytesLike, start: int = 0, source: Source | None = None) -> None:
         self._view = memoryview(data)
         self._start = start
         self._position = 0
+        self.source = source
 
     @property
     def offset(self) -> int:
@@ -73,7 +92,7 @@ class Buffer:
     def take(self, count: int, name: str = "") -> "Buffer":
         """A buffer over the next ``count`` bytes, moving this one past them."""
         chunk = self.read(count, name)
-        return Buffer(chunk, self.offset - count)
+        return Buffer(chunk, self.offset - count, self.source)
 
     def rest(self) -> "Buffer":
         """A buffer over everything left, moving this one to the end."""

@@ -3,6 +3,7 @@
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 
+from pilotfish.core.dissect.buffer import Source
 from pilotfish.core.dissect.fields import FieldType, Value
 
 
@@ -31,6 +32,9 @@ class Node:
     """Whether to show the value in hexadecimal."""
     digits: int = 0
     """How many hexadecimal digits it is shown with, if not the whole bytes."""
+    source: Source | None = None
+    """The bytes ``offset`` counts into, when they aren't the packet's own:
+    a message reassembled from several packets."""
     children: list["Node"] = field(default_factory=list)
 
     def walk(self) -> Iterator["Node"]:
@@ -52,6 +56,8 @@ class ProtocolTree:
     innermost one decoded, not counting a packet quoted inside an error."""
     error: str | None = None
     """Why decoding stopped early, if it did. The packet is marked malformed."""
+    sources: list[Source] = field(default_factory=list)
+    """The reassembled bytes some of the layers were decoded from, if any."""
 
     @property
     def protocols(self) -> tuple[str, ...]:

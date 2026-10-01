@@ -4,8 +4,10 @@ Importing this package registers every dissector in it, which is how the
 engine finds them: each module's ``@register`` decorators put it in the
 tables that route by value. Anything that decodes packets imports this once.
 
-The link, network, transport and application layers are here now.
-Reassembling what spans several packets follows in the next phase.
+The link, network, transport and application layers are here. What spans
+several packets is put back together on the way up: fragments by the IP
+dissectors, and the bytes of a TCP stream by the TCP dissector, so the
+protocols above it read whole messages.
 """
 
 from pilotfish.core.protocols import (

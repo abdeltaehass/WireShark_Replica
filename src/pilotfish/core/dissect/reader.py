@@ -45,6 +45,7 @@ class Reader:
             type=FieldType.PROTOCOL,
             offset=buffer.offset,
             length=0,
+            source=buffer.source,
         )
         self._parents = [self._node]
         self._last: Node | None = None
@@ -130,6 +131,7 @@ class Reader:
             value=value,
             hex=field.hex,
             digits=field.digits,
+            source=self._buffer.source,
         )
         parent.children.append(node)
         self._last = node

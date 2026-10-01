@@ -24,11 +24,12 @@ from pilotfish.core.dissect import (
     Dissector,
     Field,
     FieldType,
+    NeedMoreError,
     Reader,
     heuristic,
     register,
 )
-from pilotfish.core.protocols.conversations import Conversations
+from pilotfish.core.protocols.conversations import Conversations, Endpoint
 from pilotfish.core.protocols.tcp import HEURISTICS, TCP_PORT
 
 PORT = 22
@@ -36,6 +37,10 @@ PORT = 22
 GREETING = b"SSH-"
 MAX_PACKET = 35000
 """What RFC 4253 says an implementation must accept, and a sanity check here."""
+MIN_PACKET = 6
+"""A length, a padding length and a message code: the least a packet can be."""
+MAX_GREETING = 255
+"""How long RFC 4253 lets the opening line be."""
 
 KEX_INIT = 20
 NEW_KEYS = 21
@@ -147,20 +152,27 @@ class Ssh(Dissector):
     )
 
     def dissect(self, reader: Reader, context: Context) -> None:
+        sessions = context.session.store(self.name, Sessions)
+        ends = _ends(context)
+        known = sessions.conversations.get(*ends)
+        if reader.remaining < MIN_PACKET and context.can_wait and known is not None:
+            # The first bytes of a packet whose length hasn't all arrived.
+            raise NeedMoreError
         if not self.looks_like(reader.buffer, context):
             raise DeclinedError
-        sessions = context.session.store(self.name, Sessions)
-        conversation, forward = sessions.conversations.find(
-            (str(context.source or ""), context.source_port),
-            (str(context.destination or ""), context.destination_port),
-        )
+        conversation, forward = sessions.conversations.find(*ends)
         state = conversation.state
         side = state.forward if forward else state.reverse
+        if context.can_wait and (more := _unfinished(reader.buffer, side)) is not None:
+            raise more
         client = context.destination_port == PORT or forward
         reader.add("ssh.direction", 0 if client else 1)
 
-        notes = []
+        notes: list[str] = []
         while reader.remaining:
+            if notes and context.can_wait and _unfinished(reader.buffer, side) is not None:
+                # The start of a packet that the next segment finishes.
+                break
             note = self._packet(reader, side, client)
             if note is None:
                 break
@@ -174,14 +186,14 @@ class Ssh(Dissector):
         start = bytes(reader.buffer.peek(min(reader.remaining, 4)))
         if start.startswith(GREETING):
             return self._greeting(reader)
-        if reader.remaining < 6:
+        if reader.remaining < MIN_PACKET:
             return None
         if side.encrypted:
             return self._encrypted(reader)
         length = int.from_bytes(start, "big")
         if not 0 < length <= min(MAX_PACKET, reader.remaining - 4):
-            # The rest of a packet that started in an earlier segment, which
-            # takes reassembly to read: the next phase.
+            # Not a length a packet can have, so whatever this is can't be
+            # read as one.
             return self._encrypted(reader)
         reader.uint32("ssh.packet_length")
         padding = reader.uint8("ssh.padding_length")
@@ -267,15 +279,39 @@ class Ssh(Dissector):
 
     def looks_like(self, payload: Buffer, context: Context) -> bool:
         """Whether a payload starts a greeting or a plausible binary packet."""
-        if payload.remaining < 6:
+        if payload.remaining < MIN_PACKET:
             return False
-        start = bytes(payload.peek(min(payload.remaining, 8)))
-        if start.startswith(GREETING):
+        if payload.peek(len(GREETING)) == GREETING:
             return True
-        length = int.from_bytes(start[:4], "big")
-        padding = start[4]
-        return (
-            context.source_port == PORT
-            or context.destination_port == PORT
-            or (0 < length <= MAX_PACKET and 4 <= padding < 64)
-        )
+        if PORT in (context.source_port, context.destination_port):
+            return True
+        # A binary packet looks like a great many other things, so on any
+        # other port it is only believed on a connection that opened with a
+        # greeting.
+        sessions = context.session.store(self.name, Sessions)
+        return sessions.conversations.get(*_ends(context)) is not None
+
+
+def _ends(context: Context) -> tuple[Endpoint, Endpoint]:
+    """The two ends of the connection a packet belongs to."""
+    return (
+        (str(context.source or ""), context.source_port),
+        (str(context.destination or ""), context.destination_port),
+    )
+
+
+def _unfinished(payload: Buffer, side: Side) -> NeedMoreError | None:
+    """What to ask for when the packet at the front isn't all here.
+
+    Only a packet sent in the clear says how long it is. Once the keys have
+    changed the length is encrypted with everything else, so there is no
+    telling where one packet ends, and each segment is taken as it comes.
+    """
+    start = payload.peek(min(payload.remaining, MAX_GREETING))
+    if start.startswith(GREETING):
+        return None if b"\n" in start or len(start) >= MAX_GREETING else NeedMoreError()
+    if side.encrypted or len(start) < 4:
+        return None
+    length = int.from_bytes(start[:4], "big")
+    missing = length + 4 - payload.remaining
+    return NeedMoreError(missing) if 0 < length <= MAX_PACKET and missing > 0 else None

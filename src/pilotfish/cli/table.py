@@ -75,4 +75,6 @@ def protocol(tree: ProtocolTree) -> str:
     """
     if not tree.protocol:
         return "DATA" if "data" in tree.protocols else ""
-    return _ABBREVIATIONS.get(tree.protocol, tree.protocol.upper())
+    # An extension header is part of IPv6 rather than a protocol of its own.
+    name = tree.protocol.split(".")[0]
+    return _ABBREVIATIONS.get(name, name.upper())

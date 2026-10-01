@@ -7,11 +7,17 @@ which protocol carries the rest through a :class:`Handoff`. The
 into the next dissector. :func:`dissect` runs the chain for one packet and
 returns its :class:`ProtocolTree`.
 
-Protocols themselves are added in later phases; this package is only the
-frame at the root of every tree and the data that nothing claimed.
+A message that spans packets is decoded in the packet that completes it. The
+dissector reading a :class:`Stream` raises :class:`NeedMoreError` until the
+whole message is there, and the fields it then decodes point into a
+:class:`Source` of reassembled bytes rather than into the packet.
+
+The protocols themselves live in :mod:`pilotfish.core.protocols`; this
+package is only the frame at the root of every tree and the data that nothing
+claimed.
 """
 
-from pilotfish.core.dissect.buffer import Buffer
+from pilotfish.core.dissect.buffer import Buffer, Source
 from pilotfish.core.dissect.dissector import (
     LINK_TYPE,
     REGISTRY,
@@ -19,11 +25,12 @@ from pilotfish.core.dissect.dissector import (
     Dissector,
     Handoff,
     Registry,
+    Stream,
     heuristic,
     register,
 )
 from pilotfish.core.dissect.engine import MAX_LAYERS, Data, Frame, as_data, dissect
-from pilotfish.core.dissect.errors import DeclinedError, MalformedError
+from pilotfish.core.dissect.errors import DeclinedError, MalformedError, NeedMoreError
 from pilotfish.core.dissect.fields import Field, FieldRegistry, FieldType, Value
 from pilotfish.core.dissect.reader import Reader
 from pilotfish.core.dissect.session import Session
@@ -44,11 +51,14 @@ __all__ = [
     "Frame",
     "Handoff",
     "MalformedError",
+    "NeedMoreError",
     "Node",
     "ProtocolTree",
     "Reader",
     "Registry",
     "Session",
+    "Source",
+    "Stream",
     "Value",
     "as_data",
     "dissect",

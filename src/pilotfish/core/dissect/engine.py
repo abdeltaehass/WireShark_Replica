@@ -8,8 +8,9 @@ from pilotfish.core.dissect.dissector import (
     Dissector,
     Handoff,
     Registry,
+    Stream,
 )
-from pilotfish.core.dissect.errors import DeclinedError, MalformedError
+from pilotfish.core.dissect.errors import DeclinedError, MalformedError, NeedMoreError
 from pilotfish.core.dissect.fields import Field, FieldType
 from pilotfish.core.dissect.reader import Reader
 from pilotfish.core.dissect.session import Session
@@ -96,24 +97,49 @@ def dissect(
     stops where the bytes ran out, the tree keeps every field read up to
     there, and ``tree.error`` says what happened.
 
-    Pass the same ``session`` for every packet of a capture, and the
-    dissectors that follow connections can see what came before.
+    Pass the same ``session`` for every packet of a capture, in the order
+    they were captured, and the dissectors that follow connections can see
+    what came before. That is also what puts a message split across packets
+    back together: it is decoded in the packet that completes it.
     """
     tree = ProtocolTree()
     context = Context(packet=packet, number=number, session=session or Session())
     registry.add(Data, DATA_TABLE, (0,))
     dissector: Dissector | None = registry.add(Frame)
     payload = Buffer(packet.data)
+    stream: Stream | None = None
+    # A segment can hold several messages. The ones behind the message being
+    # decoded wait here until the layers inside it are done.
+    later: list[tuple[Dissector, Buffer, Stream]] = []
     while dissector is not None:
         reader = Reader(dissector.protocol, payload, registry.fields)
         quoted = context.in_error
+        offered = payload.remaining
+        context.can_wait = stream is not None and stream.open
         try:
             handoff = dissector.dissect(reader, context)
         except DeclinedError:
-            # Not this protocol after all, so it never was a layer: what the
-            # bytes are is a question for the next phase, which can put a
-            # message back together from the packets it was split across.
+            # Not this protocol after all, so it never was a layer, and the
+            # bytes stay data.
             dissector = registry.add(Data)
+            continue
+        except NeedMoreError as more:
+            if stream is None or not context.can_wait:
+                # There is nowhere for more to come from, so what is here is
+                # all there will ever be.
+                dissector = registry.add(Data)
+                continue
+            again = stream.held(more)
+            if again is not None and (again.remaining > offered or not stream.open):
+                # Either more of the message had already arrived than the
+                # dissector was shown, or the stream can't keep it and the
+                # dissector has to make do with what there is.
+                payload = again
+                continue
+            if not later:
+                break
+            dissector, payload, stream = later.pop()
+            context.keep()
             continue
         except MalformedError as error:
             # A packet quoted inside an error message is only its first bytes,
@@ -121,20 +147,45 @@ def dissect(
             # packet that doesn't hold what it claims.
             if not quoted:
                 tree.error = f"{dissector.name}: {error}"
-            tree.layers.append(reader.node())
-            _name_protocol(tree, dissector, quoted)
+            _add_layer(tree, reader, payload, dissector, quoted)
+            if stream is not None:
+                # Kept, the same bytes would come back with every segment
+                # that follows and spoil each of them in turn.
+                stream.taken(offered)
             break
-        tree.layers.append(reader.node())
-        _name_protocol(tree, dissector, quoted)
-        if handoff is None or handoff.payload.remaining == 0:
+        _add_layer(tree, reader, payload, dissector, quoted)
+        if stream is not None:
+            # A dissector that read nothing can't be offered the same bytes
+            # again, so they count as read.
+            rest = stream.taken(offered - payload.remaining or offered)
+            if rest is not None:
+                later.append((dissector, rest, stream))
+        if handoff is not None and handoff.payload.remaining:
+            if len(tree.layers) >= MAX_LAYERS:
+                tree.error = f"stopped after {MAX_LAYERS} layers"
+                break
+            dissector = handoff.dissector or _route(handoff, registry, context)
+            dissector = dissector or registry.add(Data)
+            payload, stream = handoff.payload, handoff.stream
+            continue
+        # Nothing is left inside this message, so on to the next one. What
+        # doesn't fit under the limit stays in its stream for the next packet.
+        if not later or len(tree.layers) >= MAX_LAYERS:
             break
-        if len(tree.layers) >= MAX_LAYERS:
-            tree.error = f"stopped after {MAX_LAYERS} layers"
-            break
-        dissector = handoff.dissector or _route(handoff, registry, context) or registry.add(Data)
-        payload = handoff.payload
+        dissector, payload, stream = later.pop()
+        context.keep()
     tree.info = context.info or _summary(tree)
     return tree
+
+
+def _add_layer(
+    tree: ProtocolTree, reader: Reader, payload: Buffer, dissector: Dissector, quoted: bool
+) -> None:
+    """Add a finished layer, and the reassembled bytes it was read from."""
+    tree.layers.append(reader.node())
+    if payload.source is not None and payload.source not in tree.sources:
+        tree.sources.append(payload.source)
+    _name_protocol(tree, dissector, quoted)
 
 
 def _route(handoff: Handoff, registry: Registry, context: Context) -> Dissector | None:

@@ -10,7 +10,8 @@ plain standard-library Python, and the results are checked field by field
 against real tshark output.
 
 **Status:** captures, filters and decodes from the link layer up to DNS, DHCP,
-HTTP, TLS and SSH. Reassembling messages that span packets is next.
+HTTP, TLS and SSH, puts messages that span packets back together, and follows
+a TCP stream from end to end.
 
 ## Install
 
@@ -68,7 +69,7 @@ Multicast Domain Name System (query)
     Class: 0x0001
 ```
 
-`uv run pilotfish fields` lists all 442 field names it can decode, with their
+`uv run pilotfish fields` lists all 459 field names it can decode, with their
 types. They are Wireshark's names, so `ip.src`, `tcp.flags` and
 `dns.qry.name` mean here what they mean there.
 
@@ -145,12 +146,55 @@ it (019). Jump targets are absolute, so it reads straight down.
 The same program runs over saved files too, interpreted in Python, so
 `pilotfish read -f ...` filters a capture file the same way.
 
+## Following a stream
+
+A file fetched over HTTP arrives as dozens of segments, mixed in with every
+other connection, some of them late and some sent twice. `follow` puts one
+connection's bytes back in the order they were sent and prints what each end
+said:
+
+```console
+$ uv run pilotfish follow samples/made/http-download.pcap 0
+TCP stream 0
+client  192.0.2.1:50010
+server  192.0.2.2:80
+
+client > server, 63 bytes
+GET /pilotfish.bin HTTP/1.1
+Host: example.com
+Accept: */*
+
+
+server > client, 20101 bytes
+HTTP/1.1 200 OK
+Server: pilotfish
+Content-Type: application/octet-stream
+Content-Length: 20000
+...
+```
+
+The number is the stream index `read -V` shows for each TCP packet. `--raw
+client` or `--raw server` writes one end's bytes exactly as they were sent,
+which is how to check that a download comes back whole. In that capture the
+fourth segment of the file overtakes the third and the last is sent twice,
+and the file is still rebuilt byte for byte:
+
+```console
+$ uv run pilotfish follow samples/made/http-download.pcap 0 --raw server \
+    | tail -c +102 | head -c 20000 | shasum -a 256
+4cfd36429b493d7232195a49be8270f51031a8bcc0878052b4c753eff45b9b85  -
+```
+
+(`tail` skips the 101 bytes of headers, and `head` stops before the next
+response on the same connection.) That digest is the SHA-256 of the file the
+capture was built to carry, and a test holds pilotfish to it.
+
 ## What it decodes
 
 | Layer | Protocols |
 |---|---|
 | Link | Ethernet II, 802.1Q VLAN, BSD loopback, raw IP |
-| Network | IPv4 (options, fragmentation), IPv6 (extension headers), ARP |
+| Network | IPv4 (options, fragments), IPv6 (extension headers, fragments), ARP |
 | Control | ICMP, ICMPv6 including neighbour discovery |
 | Transport | UDP, TCP with options, connection tracking and Wireshark's analysis |
 | Application | DNS, mDNS, DHCP, HTTP/1.1, TLS, SSH |
@@ -173,6 +217,12 @@ Some of what that gives you:
 - **SSH** decodes the greeting and the algorithms each end offers, with the
   HASSH fingerprint, then reports the size and direction of packets whose
   contents are encrypted.
+- **Messages that span packets** are decoded once, whole, in the packet that
+  completes them, as Wireshark does it. Fragmented IPv4 and IPv6 datagrams
+  are put back together, and each direction of a TCP connection is put back
+  in sequence whatever order its segments arrived in, with bytes that were
+  sent twice counted once. An HTTP body that was sent in chunks or compressed
+  is given back as the file it carried.
 
 ```console
 $ uv run pilotfish read samples/made/tcp.pcap
@@ -182,6 +232,15 @@ $ uv run pilotfish read samples/made/tcp.pcap
 ```
 
 (The columns are trimmed here to fit; the real ones line up.)
+
+A packet that only carries part of a message says so, and the message
+appears where its last byte does:
+
+```console
+$ uv run pilotfish read samples/wireshark-wiki/http.cap
+     34  ...  TCP   1434  80 → 3372 [ACK] Seq=16561 Ack=480 Win=6432 Len=1380 [TCP segment of a reassembled PDU]
+     38  ...  HTTP   478  HTTP/1.1 200 OK  (text/html)
+```
 
 ## How it works
 
@@ -211,10 +270,22 @@ flowchart LR
 - **Remembering.** Dissectors hold no state between packets. Anything that has
   to outlive one — TCP connections, DNS questions waiting for answers — lives
   in a per-capture session.
+- **Waiting for the rest.** TCP delivers a stream, not messages, so a
+  dissector that finds a message unfinished says how many more bytes it
+  needs and is handed the same bytes again once they have arrived. Fields
+  decoded from a reassembled message point into the reassembled bytes, the
+  way Wireshark opens a second tab beside the frame.
+- **Staying small.** Whoever sends the packets chooses what they claim, so
+  everything kept for later has a limit: fragments that never complete are
+  dropped after thirty seconds or once four megabytes are waiting, a stream
+  holds at most sixteen megabytes for an unfinished message, and a compressed
+  body is only unpacked so far.
 - **Checking.** `tshark -T json` for every sample is recorded beside it, and
-  the tests compare every field pilotfish decodes against it — about 47,000
-  values. Random bytes are fuzzed through every dissector to prove a bad
-  packet can only ever be marked malformed.
+  the tests compare every field pilotfish decodes against it — about 33,000
+  values in the captures kept here — along with which packet each message
+  lands in. Random bytes are fuzzed through every dissector, and segments and
+  fragments through reassembly in any order, to prove a bad packet can only
+  ever be marked malformed.
 
 | Path | Contents |
 |---|---|
@@ -222,6 +293,8 @@ flowchart LR
 | `src/pilotfish/core/filters/` | capture filters: instructions, disassembler, interpreter |
 | `src/pilotfish/core/dissect/` | the dissector framework |
 | `src/pilotfish/core/protocols/` | one module per protocol |
+| `src/pilotfish/core/reassembly/` | fragments and TCP streams, put back in order |
+| `src/pilotfish/core/follow.py` | following a TCP stream |
 | `src/pilotfish/cli/` | command line tool |
 | `src/pilotfish/gui/` | PySide6 desktop app |
 | `tests/`, `samples/`, `scripts/` | tests, capture files with answer keys, dev tools |
@@ -257,7 +330,7 @@ tests don't: their output for each sample is saved in the repo. See
 - [x] Phase 6: link and network layers
 - [x] Phase 7: TCP and UDP
 - [x] Phase 8: application protocols
-- [ ] Phase 9: reassembling fragments and streams
+- [x] Phase 9: reassembling fragments and streams
 
 ## Capture responsibly
 

@@ -6,6 +6,7 @@ from ipaddress import IPv4Address, IPv6Address
 from typing import ClassVar
 
 from pilotfish.core.dissect.buffer import Buffer
+from pilotfish.core.dissect.errors import NeedMoreError
 from pilotfish.core.dissect.fields import Field, FieldRegistry, FieldType
 from pilotfish.core.dissect.reader import Reader
 from pilotfish.core.dissect.session import Session
@@ -13,6 +14,40 @@ from pilotfish.core.packet import Packet
 
 LINK_TYPE = "linktype"
 """The table that picks the first dissector, by the capture's link type."""
+
+
+class Stream:
+    """Where a payload came from, when that is a run of bytes rather than a
+    message: one direction of a TCP connection.
+
+    A stream has no idea where one message ends and the next begins. Only
+    the dissector reading it does, so the engine reports back what the
+    dissector made of the bytes it was handed, and the stream answers with
+    what to hand it next.
+    """
+
+    @property
+    def open(self) -> bool:
+        """Whether more bytes can still arrive behind the ones handed over."""
+        raise NotImplementedError
+
+    def taken(self, count: int) -> Buffer | None:
+        """The dissector decoded ``count`` bytes off the front.
+
+        Returns the bytes after them, if there are any worth offering: the
+        next message in the same packet.
+        """
+        raise NotImplementedError
+
+    def held(self, more: NeedMoreError) -> Buffer | None:
+        """The message at the front isn't all here, so keep it for later.
+
+        Returns bytes to try again with straight away in two cases: when
+        more of the message has arrived than the dissector was shown, and
+        when waiting is out of the question, so that the dissector has to
+        make do with what there is.
+        """
+        raise NotImplementedError
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +68,8 @@ class Handoff:
     heuristics: str = ""
     """The list of dissectors to ask when no value matched at all."""
     dissector: "Dissector | None" = None
+    stream: Stream | None = None
+    """The stream the payload was cut from, if it is a piece of one."""
 
 
 @dataclass(slots=True)
@@ -60,6 +97,12 @@ class Context:
     in_error: bool = False
     """Whether this is the packet quoted inside an error message rather than
     the packet itself. What it holds shouldn't take over the summary."""
+    can_wait: bool = False
+    """Whether the payload is the front of a stream that more can arrive on,
+    so a dissector may raise :class:`NeedMoreError` for the rest of a
+    message instead of making do with the part it has."""
+    said: str = ""
+    """What earlier messages in this packet said, which the next one adds to."""
 
     def describe(self, text: str) -> None:
         """Say what the packet is, for the packet list.
@@ -68,8 +111,19 @@ class Context:
         inside an error message, where the packet that caused the error
         would otherwise describe the error.
         """
-        if not self.in_error:
-            self.info = text
+        if self.in_error:
+            return
+        # A message with nothing to say leaves the earlier ones as they were.
+        self.info = f"{self.said}{text}" if text else self.said.removesuffix(", ")
+
+    def keep(self) -> None:
+        """Hold on to the summary so far.
+
+        A segment can carry several messages, and the packet list should
+        name all of them rather than only the last.
+        """
+        if self.info:
+            self.said = f"{self.info}, "
 
 
 class Dissector:

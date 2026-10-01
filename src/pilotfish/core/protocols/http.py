@@ -5,14 +5,17 @@ fussiest one to read *exactly*: every line ends CRLF, the header name is
 case-insensitive, and a body may arrive in pieces whose sizes are written in
 hexadecimal between them.
 
-A message can span several TCP segments, and until reassembly arrives in the
-next phase this decodes what one segment holds: the messages that fit are
-decoded in full, and the rest give up what they can.
+A message is rarely one segment. The headers say how long the body is, in one
+of three ways, and until that much has arrived the dissector asks for more
+rather than decoding half a message. A download is decoded once, whole, in
+the packet that brings its last byte.
 
 Reference: RFC 9112 for the syntax, RFC 9110 for what the headers mean.
 """
 
+import zlib
 from dataclasses import dataclass, field
+from enum import Enum
 
 from pilotfish.core.dissect import (
     Buffer,
@@ -22,6 +25,7 @@ from pilotfish.core.dissect import (
     Field,
     FieldType,
     Handoff,
+    NeedMoreError,
     Reader,
     as_data,
     heuristic,
@@ -57,7 +61,47 @@ METHODS = frozenset(
     }
 )
 
+METHOD_NAMES = frozenset(method.encode() for method in METHODS)
+LONGEST_METHOD = max(METHOD_NAMES, key=len)
+
 VERSIONS = ("HTTP/1.1", "HTTP/1.0", "HTTP/0.9")
+
+MAX_HEAD = 64 * 1024
+"""How long a start line and its headers may run before they stop being
+waited for. Servers refuse far less."""
+
+MAX_DECODED = 64 * 1024 * 1024
+"""How much a compressed body may expand to. A few kilobytes of zeros
+compress to almost nothing, and a body built that way is meant to exhaust
+whoever unpacks it."""
+
+LAST_CHUNK = b"0\r\n\r\n"
+"""The shortest way a chunked body can end."""
+
+HEX_DIGITS = b"0123456789abcdefABCDEF"
+MAX_SIZE_DIGITS = 8
+"""As many digits as a chunk's size is believed to have: four gigabytes."""
+
+MAX_WAITING = 256
+"""How many unanswered requests a connection is remembered to have."""
+
+COMPRESSED = frozenset({"gzip", "x-gzip", "deflate", "x-deflate"})
+"""The content encodings the standard library can undo."""
+
+
+class Body(Enum):
+    """How a message says where its body ends."""
+
+    NONE = "none"
+    LENGTH = "length"
+    """A Content-Length header counts the bytes."""
+    CHUNKED = "chunked"
+    """It comes in chunks, each with its size in front, and a chunk of size
+    zero ends it."""
+    TO_END = "to the end"
+    """It says nothing, so the body is whatever arrives before the
+    connection closes."""
+
 
 # The headers with a field of their own, by the name they are sent under.
 HEADERS = {
@@ -107,6 +151,7 @@ class Requested:
     time: int
     uri: str = ""
     full_uri: str = ""
+    method: str = ""
 
 
 @dataclass(slots=True)
@@ -114,7 +159,6 @@ class Exchanges:
     """What each connection has asked, so an answer can point back at it."""
 
     pending: dict[int, list[Requested]] = field(default_factory=dict)
-    answered: dict[int, Requested] = field(default_factory=dict)
 
 
 @heuristic(HEURISTICS)
@@ -150,17 +194,32 @@ class Http(Dissector):
     )
 
     def dissect(self, reader: Reader, context: Context) -> Handoff | None:
-        message = bytes(reader.buffer.peek(reader.remaining))
+        message = reader.buffer.peek(reader.remaining)
+        if context.can_wait and _starting(message):
+            # A start line that hasn't reached its end yet, as one with a
+            # long address in it won't have.
+            raise NeedMoreError
         if not self.looks_like(reader.buffer, context):
-            # The middle of a message that started in an earlier packet. It
-            # takes reassembly to say what it holds, which is the next phase.
+            # Bytes from the middle of a message whose start the capture
+            # never saw.
             raise DeclinedError
-        head, _, _ = message.partition(b"\r\n\r\n")
+        head, blank, _ = message.partition(b"\r\n\r\n")
+        if not blank and context.can_wait and len(message) <= MAX_HEAD:
+            # The headers themselves carry on in the next segment.
+            raise NeedMoreError
         lines = head.split(b"\r\n")
         first = lines[0].decode("latin-1")
-        request = self._first_line(reader, first)
+        request = not first.startswith("HTTP/")
+        named = _named(lines[1:])
+        kind = self._kind(context, first, request, named)
+        start = len(head) + len(blank)
+        # Raises when the body isn't all here, so nothing is recorded for a
+        # message until every byte of it has arrived.
+        end = _measure(message, start, kind, named, context.can_wait)
+
+        self._first_line(reader, first)
         headers = self._headers(reader, lines[1:], request)
-        if len(head) < len(message):
+        if blank:
             # The blank line that ends the headers, which belongs to neither.
             reader.skip(2, "http")
         reader.summarize(self.title)
@@ -168,7 +227,40 @@ class Http(Dissector):
             self._describe_request(reader, context, first, headers)
         else:
             self._describe_response(reader, context, first, headers)
-        return self._body(reader, context, headers)
+        return self._body(reader, context, headers, kind, end - start)
+
+    def _kind(self, context: Context, first: str, request: bool, headers: dict[str, str]) -> Body:
+        """How this message's body is delimited, which RFC 9112 settles in
+        this order."""
+        if not request and self._has_no_body(context, first):
+            return Body.NONE
+        if "chunked" in headers.get("transfer-encoding", "").lower():
+            return Body.CHUNKED
+        if headers.get("content-length", "").isdigit():
+            return Body.LENGTH
+        # A request with no length has no body. A response with none has one
+        # that lasts until the server hangs up.
+        return Body.NONE if request else Body.TO_END
+
+    def _has_no_body(self, context: Context, first: str) -> bool:
+        """Whether a response is one of those that never carry a body,
+        whatever its headers say."""
+        words = first.split(" ")
+        code = int(words[1]) if len(words) > 1 and words[1].isdigit() else 0
+        if code // 100 == 1 or code in (204, 304):
+            return True
+        waiting = self._waiting(context)
+        method = waiting[0].method if waiting else ""
+        # The answer to HEAD describes a body it doesn't send, and a
+        # successful CONNECT turns the connection into a tunnel.
+        return method == "HEAD" or (method == "CONNECT" and code // 100 == 2)
+
+    def _waiting(self, context: Context) -> list[Requested]:
+        """The requests on this connection that haven't been answered yet."""
+        stream = _stream(context)
+        if stream is None:
+            return []
+        return context.session.store(self.name, Exchanges).pending.setdefault(stream, [])
 
     def _first_line(self, reader: Reader, first: str) -> bool:
         """The start line, which says whether this is a request or an answer.
@@ -236,36 +328,35 @@ class Http(Dissector):
         self, reader: Reader, context: Context, first: str, headers: dict[str, str]
     ) -> None:
         """What the packet list says about a request, and where to answer it."""
-        uri = first.split(" ")[1] if " " in first else ""
+        words = first.split(" ")
+        uri = words[1] if len(words) > 1 else ""
         host = headers.get("host", "")
         full = f"http://{host}{uri}" if host and uri.startswith("/") else uri
         if full:
             reader.add("http.request.full_uri", full)
         context.describe(f"{first} ")
-        stream = _stream(context)
-        if stream is None:
+        if _stream(context) is None:
             return
-        exchanges = context.session.store(self.name, Exchanges)
         when = context.packet.timestamp_ns or 0
-        waiting = Requested(context.number, when, uri, full)
-        exchanges.pending.setdefault(stream, []).append(waiting)
+        waiting = self._waiting(context)
+        if len(waiting) >= MAX_WAITING:
+            # Requests nobody is answering, or answers the capture never saw.
+            del waiting[0]
+        waiting.append(Requested(context.number, when, uri, full, words[0]))
 
     def _describe_response(
         self, reader: Reader, context: Context, first: str, headers: dict[str, str]
     ) -> None:
         """The same for an answer, which points back at what it answers."""
         context.describe(f"{first} ")
-        stream = _stream(context)
-        if stream is None:
+        waiting = self._waiting(context)
+        if not waiting:
             return
-        exchanges = context.session.store(self.name, Exchanges)
-        request = exchanges.answered.get(context.number)
-        if request is None:
-            waiting = exchanges.pending.get(stream) or []
-            if not waiting:
-                return
-            request = waiting.pop(0)
-            exchanges.answered[context.number] = request
+        words = first.split(" ")
+        # An interim answer, such as 100 Continue, leaves the request waiting
+        # for its real one.
+        interim = len(words) > 1 and words[1].startswith("1")
+        request = waiting[0] if interim else waiting.pop(0)
         reader.add("http.request_in", request.frame)
         reader.add("http.time", (context.packet.timestamp_ns or 0) - request.time)
         # Wireshark shows what was asked for alongside the answer, so an
@@ -275,53 +366,63 @@ class Http(Dissector):
         if request.full_uri:
             reader.add("http.request.full_uri", request.full_uri)
 
-    def _body(self, reader: Reader, context: Context, headers: dict[str, str]) -> Handoff | None:
-        """Whatever follows the headers in this segment.
+    def _body(
+        self, reader: Reader, context: Context, headers: dict[str, str], kind: Body, length: int
+    ) -> Handoff | None:
+        """The body, and the file it carries once its encodings are undone.
 
-        A body sent in chunks writes each chunk's size in hexadecimal on a
-        line of its own, so the pieces can be read even when the whole isn't
-        there yet.
+        Two encodings can wrap it. Chunking is how it was sent, and is always
+        undone. Compression is how it was stored, and is undone when the
+        standard library knows the format.
         """
-        if not reader.remaining:
+        if not length:
             return None
-        if "chunked" in headers.get("transfer-encoding", "").lower():
-            self._chunks(reader)
-            return None
-        declared = headers.get("content-length", "")
-        whole = declared.isdigit() and int(declared) <= reader.remaining
-        payload = reader.payload()
-        reader.add(
-            "http.file_data",
-            payload.peek(payload.remaining),
-            offset=payload.offset,
-            length=payload.remaining,
-        )
-        kind = headers.get("content-type", "").split(";")[0].strip()
-        if kind and whole:
-            # Wireshark names what a body turned out to be once it has all of
-            # it, which for a body split across packets is the packet that
-            # completes it rather than this one.
-            context.describe(f"{context.info} ({kind})")
-        return as_data(payload)
+        offset = reader.buffer.offset
+        payload = reader.payload(length)
+        sent = payload.peek(payload.remaining)
+        if kind is Body.CHUNKED:
+            sent, whole = self._chunks(reader, payload)
+        else:
+            whole = kind is not Body.LENGTH or length >= int(headers["content-length"])
+        encoding = headers.get("content-encoding", "").lower()
+        file = _unpacked(sent, encoding) if encoding and encoding != "identity" else sent
+        if file is not None:
+            reader.add("http.file_data", file, offset=offset, length=length)
+        media = headers.get("content-type", "").split(";")[0].strip()
+        if media and whole and not context.in_error:
+            # Wireshark names what a body turned out to be once it has all
+            # of it.
+            context.info += f" ({media})"
+        return None if kind is Body.CHUNKED else as_data(payload)
 
     @staticmethod
-    def _chunks(reader: Reader) -> None:
-        """The chunks of a body that were sent with their sizes in front."""
-        while reader.remaining:
-            rest = bytes(reader.buffer.peek(reader.remaining))
-            line, mark, _ = rest.partition(b"\r\n")
-            if not mark:
-                reader.skip(reader.remaining, "http.chunk_data")
-                return
-            size = int(line.split(b";")[0] or b"0", 16)
-            reader.skip(len(line) + 2, "http.chunk_size")
-            reader.add("http.chunk_size", size)
+    def _chunks(reader: Reader, body: Buffer) -> tuple[bytes, bool]:
+        """The chunks of a body that was sent with their sizes in front.
+
+        Returns the body with the chunking taken away, and whether the chunk
+        that ends it was reached.
+        """
+        pieces: list[bytes] = []
+        while body.remaining:
+            line, mark, _ = body.peek(body.remaining).partition(b"\r\n")
+            size = _chunk_size(line)
+            if not mark or size is None:
+                return b"".join(pieces), False
+            offset = body.offset
+            body.skip(len(line) + 2)
+            reader.add("http.chunk_size", size, offset=offset, length=len(line))
             if not size:
-                return
+                return b"".join(pieces), True
             with reader.inside():
-                reader.bytes("http.chunk_data", min(size, reader.remaining))
-                if reader.remaining >= 2:
-                    reader.bytes("http.chunk_boundary", 2)
+                offset = body.offset
+                data = bytes(body.read(min(size, body.remaining)))
+                reader.add("http.chunk_data", data, offset=offset, length=len(data))
+                pieces.append(data)
+                if body.remaining >= 2:
+                    offset = body.offset
+                    boundary = bytes(body.read(2))
+                    reader.add("http.chunk_boundary", boundary, offset=offset, length=2)
+        return b"".join(pieces), False
 
     def looks_like(self, payload: Buffer, context: Context) -> bool:
         """Whether a payload on any port at all starts an HTTP message.
@@ -329,14 +430,119 @@ class Http(Dissector):
         A server on a port nobody registered is still an HTTP server if it
         answers like one, which is how Wireshark finds them too.
         """
-        # Long enough for any first line worth the name: a request line is a
-        # method, what it wants, and the version, and a URI can be long.
-        start = bytes(payload.peek(min(payload.remaining, 1024)))
-        line = start.split(b"\r\n")[0].decode("latin-1", "replace")
-        words = line.split(" ")
-        if words[0].startswith("HTTP/"):
+        start = payload.peek(min(payload.remaining, len(LONGEST_METHOD) + 1))
+        if start.startswith(b"HTTP/"):
             return True
-        return words[0] in METHODS and " HTTP/" in line
+        method, space, _ = start.partition(b" ")
+        if not space or method not in METHOD_NAMES:
+            return False
+        # A request line is a method, what it wants, and the version, and
+        # what it wants can be long.
+        line, _, _ = payload.peek(min(payload.remaining, MAX_HEAD)).partition(b"\r\n")
+        return b" HTTP/" in line
+
+
+def _starting(message: bytes) -> bool:
+    """Whether these bytes could be a start line that isn't finished.
+
+    They are when no line has ended yet and what there is reads like the
+    beginning of a request or a response: a method, or as much of one as has
+    arrived.
+    """
+    if not message or b"\n" in message or len(message) > MAX_HEAD:
+        return False
+    word, space, _ = message.partition(b" ")
+    if space:
+        return word in METHOD_NAMES or word.startswith(b"HTTP/")
+    return any(name.startswith(word) for name in (*METHOD_NAMES, b"HTTP/1.1", b"HTTP/1.0"))
+
+
+def _named(lines: list[bytes]) -> dict[str, str]:
+    """The headers by name, lower-cased, without recording anything."""
+    headers: dict[str, str] = {}
+    for raw in lines:
+        name, mark, value = raw.decode("latin-1").partition(":")
+        if mark:
+            headers[name.strip().lower()] = value.strip()
+    return headers
+
+
+def _chunk_size(line: bytes) -> int | None:
+    """The size a chunk's first line gives, in hexadecimal, or ``None`` when
+    the line isn't one.
+
+    Only digits count. ``int`` would also take a sign, and a chunk of minus
+    two bytes is one that never ends.
+    """
+    digits = line.split(b";")[0].strip()
+    if not digits or len(digits) > MAX_SIZE_DIGITS or digits.strip(HEX_DIGITS):
+        return None
+    return int(digits, 16)
+
+
+def _measure(message: bytes, start: int, kind: Body, headers: dict[str, str], wait: bool) -> int:
+    """Where the message ends, given that its body starts at ``start``.
+
+    Raises :class:`NeedMoreError` when the end hasn't arrived and ``wait``
+    says it still can. Otherwise a message that is cut short ends where the
+    bytes do.
+    """
+    here = len(message) - start
+    if kind is Body.NONE:
+        return start
+    if kind is Body.LENGTH:
+        declared = int(headers["content-length"])
+        if here < declared and wait:
+            raise NeedMoreError(declared - here)
+        return start + min(declared, here)
+    if kind is Body.TO_END:
+        if wait:
+            raise NeedMoreError(to_end=True)
+        return len(message)
+    at = start
+    while True:
+        line_end = message.find(b"\r\n", at)
+        size = None if line_end < 0 else _chunk_size(message[at:line_end])
+        if line_end < 0 and wait and len(message) - at <= MAX_HEAD:
+            raise NeedMoreError
+        if size is None:
+            # Not a chunk at all, so there is no telling where this ends.
+            return len(message)
+        at = line_end + 2
+        if not size:
+            break
+        missing = at + size + 2 - len(message)
+        if missing > 0:
+            if wait:
+                # The rest of this chunk, and at the very least the chunk
+                # of size zero that ends the body.
+                raise NeedMoreError(missing + len(LAST_CHUNK))
+            return len(message)
+        at += size + 2
+    # After the last chunk come any trailing headers, and a blank line.
+    while True:
+        line_end = message.find(b"\r\n", at)
+        if line_end < 0:
+            if wait and len(message) - at <= MAX_HEAD:
+                raise NeedMoreError
+            return len(message)
+        at, blank = line_end + 2, line_end == at
+        if blank:
+            return at
+
+
+def _unpacked(body: bytes, encoding: str) -> bytes | None:
+    """A compressed body as the file it holds, or ``None`` if it won't unpack."""
+    if encoding not in COMPRESSED:
+        return None
+    # 47 tells zlib to work out for itself whether the wrapper is gzip's or
+    # its own. Some servers send "deflate" with no wrapper at all.
+    for bits in (47, -zlib.MAX_WBITS):
+        try:
+            return zlib.decompressobj(bits).decompress(body, MAX_DECODED)
+        except zlib.error:
+            continue
+    return None
 
 
 def _stream(context: Context) -> int | None:

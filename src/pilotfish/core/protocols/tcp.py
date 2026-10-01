@@ -7,6 +7,13 @@ and the judgements Wireshark makes about a segment that doesn't advance the
 sequence number, which is either a retransmission, an out-of-order segment or
 a duplicate of one already acknowledged.
 
+The other thing a connection's history gives is its bytes in order. TCP
+delivers a stream, and cuts it into segments wherever it pleases, so a
+message can start in one packet and finish several later. Each direction's
+bytes are put back in sequence as they arrive, and the protocol on top reads
+whole messages off the front. A segment that only carries part of one is
+listed as that, and the message is decoded in the packet that completes it.
+
 References: RFC 9293 for the protocol, RFC 7323 for window scaling and
 timestamps, RFC 2018 for selective acknowledgement. The analysis follows
 Wireshark's ``tcp_analyze_sequence_number`` so its verdicts can be compared
@@ -16,14 +23,17 @@ with ours.
 from dataclasses import dataclass, field
 
 from pilotfish.core.dissect import (
+    Buffer,
     Context,
     Dissector,
     Field,
     FieldType,
     Handoff,
     MalformedError,
+    NeedMoreError,
     Reader,
-    as_data,
+    Source,
+    Stream,
     register,
 )
 from pilotfish.core.protocols.checksum import (
@@ -32,8 +42,9 @@ from pilotfish.core.protocols.checksum import (
     pseudo_header,
     verify,
 )
-from pilotfish.core.protocols.conversations import Conversations
+from pilotfish.core.protocols.conversations import Conversation, Conversations, Endpoint
 from pilotfish.core.protocols.ip import IP_PROTO, PROTO_TCP
+from pilotfish.core.reassembly import Flow
 
 TCP_PORT = "tcp.port"
 """The table keyed by port, for what a segment carries."""
@@ -94,12 +105,16 @@ FAST_RETRANSMISSION_NS = 20_000_000
 """How soon after duplicate acknowledgements a retransmission counts as fast."""
 DUPLICATE_ACKS_BEFORE_FAST = 2
 
-RESENT = frozenset({"retransmission", "fast_retransmission", "spurious_retransmission"})
-"""The judgements that mean these bytes have been along this way before."""
-
 WINDOW_UNSEEN = -1
 """The window of a direction nothing has been seen from, which no real window
 can be equal to."""
+
+LISTENER = "tcp.listener"
+"""Where a capture keeps whoever is following one of its connections."""
+
+WAITING = " [TCP segment of a reassembled PDU]"
+"""What the packet list says of a segment whose bytes belong to a message
+that a later packet completes."""
 
 
 @dataclass(slots=True)
@@ -145,6 +160,8 @@ class Side:
     """What the analysis said about the last segment from this side."""
     sent: list[Sent] = field(default_factory=list)
     """Segments sent and not yet acknowledged, newest first."""
+    flow: Flow = field(default_factory=Flow)
+    """The bytes this side sent, back in the order it sent them."""
 
 
 @dataclass(slots=True)
@@ -156,6 +173,36 @@ class Connection:
     initial_rtt: int | None = None
     """From that SYN to the first ordinary acknowledgement: the round trip of
     the handshake, which is what re-ordering is measured against."""
+    opened_forward: bool | None = None
+    """Whether the end that sent the capture's first packet is the one that
+    opened the connection. Not known unless a SYN was captured."""
+
+
+@dataclass(frozen=True, slots=True)
+class Heard:
+    """A run of bytes one end sent, in the order it sent them."""
+
+    forward: bool
+    """Whether they went the way the connection's first packet did."""
+    data: bytes
+    missed: int = 0
+    """How many bytes the capture lost just before these."""
+
+
+@dataclass(slots=True)
+class Listener:
+    """Whoever is following one connection.
+
+    While a capture has a listener the segments are put in order and nothing
+    more: no protocol on top is decoded, since all that is wanted is the
+    bytes.
+    """
+
+    stream: int
+    heard: list[Heard] = field(default_factory=list)
+    conversation: Conversation[Connection] | None = None
+    responder: Endpoint | None = None
+    """The end that didn't send the first packet."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,6 +274,11 @@ class Tcp(Dissector):
         Field("tcp.options.timestamp.tsval", FieldType.UINT, "Timestamp value"),
         Field("tcp.options.timestamp.tsecr", FieldType.UINT, "Timestamp echo reply"),
         Field("tcp.payload", FieldType.BYTES, "TCP payload"),
+        Field("tcp.segment_data", FieldType.BYTES, "TCP segment data"),
+        Field("tcp.segment", FieldType.UINT, "TCP Segment"),
+        Field("tcp.segment.count", FieldType.UINT, "Segment count"),
+        Field("tcp.reassembled.length", FieldType.UINT, "Reassembled TCP length"),
+        Field("tcp.reassembled.data", FieldType.BYTES, "Reassembled TCP Data"),
         # What the connection's history says about this segment.
         Field("tcp.analysis.acks_frame", FieldType.UINT, "This is an ACK to the segment in frame"),
         Field("tcp.analysis.ack_rtt", FieldType.TIME, "The RTT to ACK the segment was"),
@@ -272,8 +324,9 @@ class Tcp(Dissector):
 
         window = reader.uint16("tcp.window_size_value")
         checksum = reader.uint16("tcp.checksum")
+        status = self._status(context, whole, checksum)
         with reader.inside():
-            reader.add("tcp.checksum.status", int(self._status(context, whole, checksum)))
+            reader.add("tcp.checksum.status", int(status))
         reader.uint16("tcp.urgent_pointer")
 
         conversations = context.session.store(self.name, lambda: Conversations(Connection))
@@ -327,27 +380,102 @@ class Tcp(Dissector):
         # Wireshark's packet list shows.
         described += f" Win={scaled} Len={payload_length}{notes}"
         context.describe(_markers(found, side) + described)
+        if flags & SYN and not flags & ACK:
+            connection.opened_forward = forward
+        elif flags & SYN and connection.opened_forward is None:
+            connection.opened_forward = not forward
         payload = reader.payload()
-        if not payload.remaining:
+        data = payload.peek(payload.remaining)
+        if data:
+            reader.add("tcp.payload", data, offset=payload.offset, length=len(data))
+        ports = (min(source_port, destination_port), max(source_port, destination_port))
+        if context.in_error or context.truncated or status is ChecksumStatus.BAD:
+            # None of these can join the stream: a segment quoted in an error
+            # message isn't part of the connection, one the capture cut short
+            # is missing bytes, and one that arrived damaged was thrown away
+            # by whoever received it. Each is read for what it holds alone.
+            if context.truncated and not context.in_error:
+                side.flow.restart()
+            if not payload.remaining:
+                return None
+            return Handoff(TCP_PORT, ports[0], payload, also=ports[1:], heuristics=HEURISTICS)
+        listening = self._listening(context, conversation, forward)
+        delivery = self._join(reader, context, side, other, segment, payload, data)
+        if listening:
+            # Somebody is following a stream of this capture, and wants its
+            # bytes in order and nothing decoded from them.
+            side.flow.take(len(side.flow.pending))
             return None
-        reader.add(
-            "tcp.payload",
-            payload.peek(payload.remaining),
-            offset=payload.offset,
-            length=payload.remaining,
-        )
-        if found & RESENT:
-            # The bytes of a resent segment were carried by an earlier one, so
-            # whatever they are has been decoded already. Wireshark leaves
-            # them alone for the same reason.
-            return as_data(payload)
+        offer = delivery.offer() if delivery is not None else None
+        if offer is None:
+            return None
         return Handoff(
-            TCP_PORT,
-            min(source_port, destination_port),
-            payload,
-            also=(max(source_port, destination_port),),
-            heuristics=HEURISTICS,
+            TCP_PORT, ports[0], offer, also=ports[1:], heuristics=HEURISTICS, stream=delivery
         )
+
+    @staticmethod
+    def _listening(context: Context, conversation: Conversation[Connection], forward: bool) -> bool:
+        """Whether somebody is following a connection of this capture.
+
+        The first packet of the connection they asked for is where they start
+        listening to each of its directions.
+        """
+        if LISTENER not in context.session:
+            return False
+        listener = context.session.store(LISTENER, lambda: Listener(conversation.index))
+        if listener.stream != conversation.index or listener.conversation is not None:
+            return True
+        listener.conversation = conversation
+        source: Endpoint = (context.source or "", context.source_port)
+        destination: Endpoint = (context.destination or "", context.destination_port)
+        listener.responder = destination if forward else source
+        heard = listener.heard
+        state = conversation.state
+        state.forward.flow.heard = lambda data, missed: heard.append(Heard(True, data, missed))
+        state.reverse.flow.heard = lambda data, missed: heard.append(Heard(False, data, missed))
+        return True
+
+    @staticmethod
+    def _join(
+        reader: Reader,
+        context: Context,
+        side: Side,
+        other: Side,
+        segment: Segment,
+        payload: Buffer,
+        data: bytes,
+    ) -> "Delivery | None":
+        """Put the segment's bytes into its direction's stream.
+
+        Returns the segment's turn at the stream when there is something in
+        order to show the protocol on top, and ``None`` for a segment that
+        brought nothing new or is waiting on a gap.
+        """
+        flow = side.flow
+        if segment.flags & ACK and not segment.flags & RESET:
+            # What this end has received settles what the capture is still
+            # waiting to see from the other.
+            other.flow.acknowledge(other.flow.position(segment.acknowledged))
+        if segment.flags & SYN and (flow.next is None or segment.sequence):
+            # A SYN starts the numbering, and takes the first number itself.
+            # One that isn't where this connection began is the same ports
+            # being used over again.
+            flow.restart(segment.sequence + 1)
+        closing = bool(segment.flags & (FIN | RESET))
+        if not (segment.length or closing):
+            return None
+        position = flow.position(segment.sequence + (1 if segment.flags & SYN else 0))
+        added = flow.add(position, data, segment.frame)
+        if closing:
+            flow.close(position + segment.length)
+        delivery = Delivery(reader, context, flow, payload, data, position, added.seen)
+        # The front of a segment can repeat what an earlier one brought.
+        delivery.mark(0, min(added.seen, segment.length))
+        if added.fresh or (closing and flow.ready):
+            return delivery
+        # Ahead of a gap, and kept until the bytes before it arrive.
+        delivery.mark(added.seen, segment.length)
+        return None
 
     @staticmethod
     def _flags(reader: Reader, flags: int, offset: int) -> None:
@@ -744,6 +872,160 @@ class Tcp(Dissector):
             reader.add("tcp.analysis.duplicate_ack_num", side.duplicate_acks)
             if side.last_non_duplicate_ack:
                 reader.add("tcp.analysis.duplicate_ack_frame", side.last_non_duplicate_ack)
+
+
+class Delivery(Stream):
+    """One segment's turn at its stream.
+
+    The segment's bytes have joined the stream by the time this exists. What
+    is left is to offer the protocol on top whatever is now in order, as many
+    messages as that turns out to hold, and to say which of the segment's own
+    bytes ended up decoded somewhere other than in this packet.
+
+    What gets offered is the segment's own bytes when the message at the front
+    starts in this segment, so its fields point into the packet as usual.
+    When the message started in an earlier packet, the bytes offered are the
+    reassembled ones, and the segments they came from are listed.
+    """
+
+    def __init__(
+        self,
+        reader: Reader,
+        context: Context,
+        flow: Flow,
+        payload: Buffer,
+        data: bytes,
+        position: int,
+        seen: int,
+    ) -> None:
+        self._reader = reader
+        self._context = context
+        self._flow = flow
+        self._frame = context.number
+        self._data = data
+        self._offset = payload.offset
+        self._origin = payload.source
+        self._position = position
+        """Where the segment's first byte belongs in the stream."""
+        self._seen = seen
+        """How many of its leading bytes an earlier segment had brought."""
+        self._whole: Source | None = None
+        """The reassembled bytes on offer, when the offer isn't the segment's own."""
+        self._frames: tuple[int, ...] = ()
+        self._inside = (0, 0)
+        """Which of the segment's bytes are among them."""
+        self._used = 0
+        self._decoded = False
+
+    @property
+    def open(self) -> bool:
+        return self._flow.open
+
+    def offer(self) -> Buffer | None:
+        """The bytes at the front of the stream, if they are worth decoding."""
+        flow = self._flow
+        if not flow.ready:
+            self.wait()
+            return None
+        size = len(flow.pending)
+        if len(flow.pieces) == 1 and flow.pieces[0].frame == self._frame:
+            # Everything waiting came in this segment, and is the end of it.
+            self._whole = None
+            start = len(self._data) - size
+            return Buffer(memoryview(self._data)[start:], self._offset + start, self._origin)
+        # Just the message that was being waited for, when its length is
+        # known and everything after it came in this segment, so that what
+        # follows can be read from the packet itself.
+        extent, last = size, flow.pieces[-1]
+        if flow.exact and last.frame == self._frame and size - last.length <= flow.wanted <= size:
+            extent = flow.wanted
+        whole = bytes(flow.pending[:extent])
+        self._whole = Source("Reassembled TCP", whole)
+        self._used = 0
+        self._frames = _frames(flow, extent)
+        if flow.to_end and self._frame not in self._frames:
+            # A message that ran to the end of the stream was finished by the
+            # segment that closed it, which Wireshark counts as one of its
+            # segments even when it carried nothing.
+            self._frames += (self._frame,)
+        mine = self._position + self._seen
+        end = self._position + len(self._data)
+        self._inside = (
+            max(flow.start, mine) - self._position,
+            min(flow.start + extent, end) - self._position,
+        )
+        return Buffer(whole, 0, self._whole)
+
+    def taken(self, count: int) -> Buffer | None:
+        whole = self._whole
+        if whole is not None and not self._used:
+            # The first message out of reassembled bytes says where they
+            # came from.
+            for frame in self._frames:
+                self._reader.add("tcp.segment", frame)
+            self._reader.add("tcp.segment.count", len(self._frames))
+            self._reader.add("tcp.reassembled.length", len(whole.data))
+            self._reader.add("tcp.reassembled.data", whole.data)
+        self._flow.take(count)
+        self._decoded = True
+        if whole is not None:
+            self._used += count
+            if self._used < len(whole.data):
+                return Buffer(memoryview(whole.data)[self._used :], self._used, whole)
+            self.mark(*self._inside)
+            self._whole = None
+        return self.offer() if self._flow.pending else None
+
+    def held(self, more: NeedMoreError) -> Buffer | None:
+        flow = self._flow
+        shown = len(flow.pending)
+        if self._whole is not None:
+            shown = len(self._whole.data) - self._used
+        flow.wait(more.count, to_end=more.to_end, have=shown)
+        if not flow.ready:
+            self.wait()
+            return None
+        # Either the bytes it wants are here already, behind the ones it was
+        # shown, or the stream has no way of getting it any more.
+        if self._whole is not None and self._used:
+            self.mark(*self._inside)
+        return self.offer()
+
+    def wait(self) -> None:
+        """Leave what the segment brought for the packet that completes it."""
+        low = max(self._flow.start - self._position, self._seen)
+        if self._whole is not None and self._used:
+            low = self._inside[0]
+        if low >= len(self._data):
+            return
+        self.mark(low, len(self._data))
+        if not self._decoded:
+            self._context.info += WAITING
+
+    def mark(self, low: int, high: int) -> None:
+        """Record bytes of the segment that weren't decoded as part of it.
+
+        They belong to a message that another packet completes, or were
+        brought by an earlier segment already.
+        """
+        if low < high:
+            self._reader.add(
+                "tcp.segment_data",
+                self._data[low:high],
+                offset=self._offset + low,
+                length=high - low,
+            )
+
+
+def _frames(flow: Flow, extent: int) -> tuple[int, ...]:
+    """The packets the first ``extent`` waiting bytes arrived in."""
+    frames: dict[int, None] = {}
+    for piece in flow.pieces:
+        if extent <= 0:
+            break
+        frames[piece.frame] = None
+        extent -= piece.length
+    return tuple(frames)
 
 
 def _offered(side: Side) -> int:

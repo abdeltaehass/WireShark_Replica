@@ -8,16 +8,21 @@ register there too.
 Reference: the IANA protocol numbers registry.
 """
 
+from collections.abc import Hashable
+
 from pilotfish.core.dissect import (
     LINK_TYPE,
     Buffer,
     Context,
     Dissector,
     Handoff,
+    MalformedError,
     Reader,
     register,
 )
 from pilotfish.core.packet import Packet
+from pilotfish.core.reassembly import Fragments, Reassembled
+from pilotfish.core.reassembly.fragments import MAX_DATAGRAM
 
 IP_PROTO = "ip.proto"
 """The table keyed by protocol number, for what an IP packet carries."""
@@ -37,6 +42,9 @@ libpcap writes 101 now, but tcpdump's registry keeps both."""
 LINKTYPE_RAW_OPENBSD = 14
 LINKTYPE_IPV4 = 228
 LINKTYPE_IPV6 = 229
+
+FRAGMENTS = "ip.fragments"
+"""Where a capture keeps the datagrams still waiting for fragments."""
 
 
 @register(LINK_TYPE, LINKTYPE_RAW, LINKTYPE_RAW_BSD, LINKTYPE_RAW_OPENBSD)
@@ -64,3 +72,36 @@ def cut_short(payload: Buffer, declared: int, packet: Packet) -> bool:
     length cutting a frame short that leaves bytes nobody can see.
     """
     return payload.remaining < min(declared, packet.original_length - payload.offset)
+
+
+def reassemble(
+    context: Context, payload: Buffer, key: Hashable, offset: int, more: bool
+) -> Reassembled | None:
+    """Add a fragment to its datagram, and return the datagram once complete.
+
+    A fragment quoted inside an error message is not one of the capture's
+    own, and one the capture cut short is missing bytes the datagram needs,
+    so neither is counted.
+    """
+    if context.in_error or context.truncated:
+        return None
+    if offset + payload.remaining > MAX_DATAGRAM:
+        # The trick behind the "ping of death": fragments that are each
+        # legal, and add up to more than any datagram can be.
+        raise MalformedError(
+            f"a fragment reaching byte {offset + payload.remaining} "
+            f"is past the {MAX_DATAGRAM} a datagram can hold"
+        )
+    fragments = context.session.store(FRAGMENTS, Fragments)
+    whole = fragments.add(
+        key,
+        offset,
+        payload.peek(payload.remaining),
+        more=more,
+        frame=context.number,
+        time=context.packet.timestamp_ns,
+    )
+    if whole is not None:
+        # The datagram is all here, whatever the last frame's own length says.
+        context.truncated = False
+    return whole

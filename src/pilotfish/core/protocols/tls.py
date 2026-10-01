@@ -6,9 +6,11 @@ versions and ciphers each will accept, and, in the ClientHello, the name of
 the server being asked for. That name is the reason this dissector earns its
 place — it is the last plainly readable thing in a modern web request.
 
-A record may hold several handshake messages, a message may be split across
-records and a record across TCP segments. The last of those needs reassembly,
-which is the next phase; the first two are handled here.
+A record may hold several handshake messages, and a record may be split
+across TCP segments, which it often is: a record can be sixteen kilobytes and
+a segment rarely holds more than one and a half. Its header says how long it
+is, so a record that isn't all here is asked for again once the rest of it
+has arrived.
 
 References: RFC 8446 for TLS 1.3, RFC 5246 for 1.2, RFC 6066 for the server
 name extension and RFC 7301 for ALPN.
@@ -24,15 +26,19 @@ from pilotfish.core.dissect import (
     Dissector,
     Field,
     FieldType,
+    NeedMoreError,
     Reader,
     heuristic,
     register,
 )
-from pilotfish.core.protocols.conversations import Conversations
+from pilotfish.core.protocols.conversations import Conversations, Endpoint
 from pilotfish.core.protocols.tcp import HEURISTICS, TCP_PORT
 
 PORTS = (443, 465, 563, 636, 989, 990, 992, 993, 995, 5061, 8443)
 """The ports that carry TLS without anyone having to say so."""
+
+RECORD_HEADER = 5
+"""A content type, a version and a length, in front of every record."""
 
 CHANGE_CIPHER_SPEC = 20
 ALERT = 21
@@ -253,39 +259,43 @@ class Tls(Dissector):
     )
 
     def dissect(self, reader: Reader, context: Context) -> None:
-        if not self.looks_like(reader.buffer, context):
-            # The rest of a record that started in an earlier packet, which
-            # takes reassembly to read: the next phase.
+        streams = context.session.store(self.name, Streams)
+        ends = _ends(context)
+        if reader.remaining < RECORD_HEADER:
+            # Too little to tell. On a connection already known to be TLS it
+            # is the start of a record whose header was split.
+            if context.can_wait and streams.conversations.get(*ends) is not None:
+                raise NeedMoreError
             raise DeclinedError
-        connection = self._connection(reader, context)
+        if not self.looks_like(reader.buffer, context):
+            # Bytes from the middle of a record whose start the capture
+            # never saw.
+            raise DeclinedError
+        if context.can_wait and (missing := _missing(reader.buffer)):
+            raise NeedMoreError(missing)
+        conversation, _ = streams.conversations.find(*ends)
+        reader.add("tls.stream", conversation.index)
         notes: list[str] = []
-        while reader.remaining >= 5:
-            notes.extend(self._record(reader, connection))
+        while reader.remaining >= RECORD_HEADER:
+            if notes and context.can_wait and _missing(reader.buffer):
+                # The start of a record that the next segment finishes. It is
+                # left where it is, to be read when the rest has arrived.
+                break
+            notes.extend(self._record(reader, conversation.state))
         reader.summarize(self.title)
         context.describe(", ".join(notes))
         return None
 
-    def _connection(self, reader: Reader, context: Context) -> Connection:
-        """Which connection this is, and what it has agreed so far."""
-        streams = context.session.store(self.name, Streams)
-        conversation, _ = streams.conversations.find(
-            (str(context.source or ""), context.source_port),
-            (str(context.destination or ""), context.destination_port),
-        )
-        reader.add("tls.stream", conversation.index)
-        return conversation.state
-
     def _record(self, reader: Reader, connection: Connection) -> list[str]:
         """One record: what it holds, how long it is, and then its contents.
 
-        A record whose length reaches past this segment isn't decoded at all:
-        the rest of it is in a packet that hasn't been read yet, and putting
-        the two together is the next phase's job.
+        A record whose length reaches past the bytes there are, with no more
+        to come, isn't decoded: what is here is only the front of it.
         """
-        start = reader.buffer.peek(5)
-        if int.from_bytes(start[3:5], "big") > reader.remaining - 5:
+        if _missing(reader.buffer):
             reader.bytes("tls.segment.data", reader.remaining)
             return []
+        start = reader.buffer.peek(RECORD_HEADER)
         kind = start[0]
         # Once the handshake is over, TLS 1.3 sends everything as application
         # data, whatever it really is, so Wireshark names the type opaque.
@@ -658,3 +668,17 @@ class Tls(Dissector):
             and 0x0300 <= version <= 0x0304
             and 0 < length <= 0x4000 + 2048
         )
+
+
+def _ends(context: Context) -> tuple[Endpoint, Endpoint]:
+    """The two ends of the connection a record belongs to."""
+    return (
+        (str(context.source or ""), context.source_port),
+        (str(context.destination or ""), context.destination_port),
+    )
+
+
+def _missing(payload: Buffer) -> int:
+    """How many bytes of the record at the front haven't arrived."""
+    header = payload.peek(RECORD_HEADER)
+    return max(RECORD_HEADER + int.from_bytes(header[3:5], "big") - payload.remaining, 0)

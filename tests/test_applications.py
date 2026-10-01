@@ -315,8 +315,8 @@ class TestHttp:
         assert tree.values("http.chunk_data") == [b"hello", b" world"]
 
     def test_the_middle_of_a_message_is_left_alone(self) -> None:
-        # Nothing here says what it is, and saying so would take the packets
-        # before it, which is the next phase's work.
+        # Nothing here says what it is. The packets before it would, and the
+        # capture doesn't have them.
         tree = decode(over_tcp(b"</body>\r\n</html>\r\n"))
         assert "http" not in tree.protocols
         assert tree.protocols[-1] == "data"
@@ -383,12 +383,13 @@ class TestTls:
         assert tree.info == "Change Cipher Spec, Application Data"
 
     def test_a_record_that_reaches_past_this_segment(self) -> None:
-        # What is here is part of a record; the rest of it is in a packet
-        # that hasn't been read yet, and joining them is the next phase.
+        # What is here is the start of a record. The rest of it is in a
+        # packet that hasn't arrived yet, and that packet is where the
+        # record will be decoded.
         payload = struct.pack(">BHH", 23, 0x0303, 4000) + bytes(40)
         tree = decode(over_tcp(payload, port=443))
-        assert tree.get("tls.segment.data") == payload
-        assert "tls.record.length" not in tree
+        assert "tls" not in tree.protocols
+        assert tree.get("tcp.segment_data") == payload
 
     def test_an_alert(self) -> None:
         tree = decode(over_tcp(record_layer(21, bytes([2, 40])), port=443))

@@ -232,3 +232,32 @@ def test_read_marks_what_the_tcp_analysis_found(capsys: pytest.CaptureFixture[st
     assert marked[34].startswith("[TCP ACKed unseen segment] ")
     # The handshake's options are listed the way tshark lists them.
     assert rows[1].endswith("50000 → 80 [SYN] Seq=0 Win=8000 Len=0 MSS=1460 WS=1 SACK_PERM")
+
+
+def test_read_shows_a_message_in_the_packet_that_completes_it(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A download is one line of HTTP, after the segments that carried it."""
+    samples = Path(__file__).resolve().parent.parent / "samples"
+    assert main(["read", str(samples / "made" / "http-download.pcap")]) == 0
+    rows = {int(row.split()[0]): row for row in capsys.readouterr().out.splitlines()[1:]}
+    protocols = {number: row.split()[4] for number, row in rows.items()}
+    assert [protocols[number] for number in range(6, 20)] == ["TCP"] * 13 + ["HTTP"]
+    assert rows[7].endswith("Len=1460 [TCP segment of a reassembled PDU]")
+    assert rows[19].endswith("HTTP/1.1 200 OK  (application/octet-stream)")
+    # The segment that arrived ahead of a gap is explained by the gap.
+    assert "[TCP Previous segment not captured]" in rows[8]
+    assert "reassembled PDU" not in rows[8]
+
+
+def test_read_names_a_fragment_by_the_protocol_that_was_cut_up(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    samples = Path(__file__).resolve().parent.parent / "samples"
+    assert main(["read", str(samples / "made" / "fragments.pcap")]) == 0
+    rows = capsys.readouterr().out.splitlines()[1:]
+    assert [row.split()[4] for row in rows] == [
+        *["IPv4", "IPv4", "ICMP"] * 2,
+        *["IPv4", "IPv4", "UDP", "IPv4"],
+        *["IPv6", "ICMPv6"] * 2,
+    ]
