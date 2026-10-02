@@ -8,7 +8,8 @@ runs them, which is how a filter written for the kernel can also be applied
 to packets read from a file.
 
 A capture filter decides what is captured at all. Display filters, which pick
-from packets already captured, are a separate thing and come later.
+from packets already captured and decoded, are a separate thing, in
+:mod:`pilotfish.core.display`.
 """
 
 from pilotfish.core.filters.errors import FilterError

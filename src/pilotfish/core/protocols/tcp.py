@@ -229,6 +229,12 @@ class Tcp(Dissector):
     fields = (
         Field("tcp.srcport", FieldType.UINT, "Source Port"),
         Field("tcp.dstport", FieldType.UINT, "Destination Port"),
+        Field(
+            "tcp.port",
+            FieldType.UINT,
+            "Source or Destination Port",
+            either=("tcp.srcport", "tcp.dstport"),
+        ),
         Field("tcp.stream", FieldType.UINT, "Stream index"),
         Field("tcp.len", FieldType.UINT, "TCP Segment Len"),
         Field("tcp.seq", FieldType.UINT, "Sequence Number"),

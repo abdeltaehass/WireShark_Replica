@@ -87,6 +87,12 @@ class IPv6(Dissector):
         Field("ipv6.hlim", FieldType.UINT, "Hop Limit"),
         Field("ipv6.src", FieldType.IPV6, "Source Address"),
         Field("ipv6.dst", FieldType.IPV6, "Destination Address"),
+        Field(
+            "ipv6.addr",
+            FieldType.IPV6,
+            "Source or Destination Address",
+            either=("ipv6.src", "ipv6.dst"),
+        ),
     )
 
     def dissect(self, reader: Reader, context: Context) -> Handoff | None:

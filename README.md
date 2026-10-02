@@ -10,8 +10,9 @@ plain standard-library Python, and the results are checked field by field
 against real tshark output.
 
 **Status:** captures, filters and decodes from the link layer up to DNS, DHCP,
-HTTP, TLS and SSH, puts messages that span packets back together, and follows
-a TCP stream from end to end.
+HTTP, TLS and SSH, puts messages that span packets back together, follows a
+TCP stream from end to end, and picks packets out with display filters in
+Wireshark's syntax.
 
 ## Install
 
@@ -43,7 +44,8 @@ Useful flags:
 | Flag | What it does |
 |---|---|
 | `-V` | print each packet's full protocol tree |
-| `-f 'udp port 53'` | keep only matching packets |
+| `-Y 'tcp.port == 443'` | list only the packets a display filter matches |
+| `-f 'udp port 53'` | keep only the packets a capture filter matches |
 | `--time-format utc` | dates instead of epoch seconds |
 
 `-V` prints a tree like Wireshark's detail pane:
@@ -69,7 +71,7 @@ Multicast Domain Name System (query)
     Class: 0x0001
 ```
 
-`uv run pilotfish fields` lists all 459 field names it can decode, with their
+`uv run pilotfish fields` lists all 464 field names it can decode, with their
 types. They are Wireshark's names, so `ip.src`, `tcp.flags` and
 `dns.qry.name` mean here what they mean there.
 
@@ -102,7 +104,7 @@ Capturing on lo0 (Loopback)
 On Wi-Fi you mostly see your own Mac's traffic plus broadcast and multicast.
 That's normal: the card only passes up frames addressed to this Mac.
 
-## Filters
+## Capture filters
 
 `-f` takes a filter in libpcap's syntax — the same one tcpdump and Wireshark
 use — which is compiled and handed to the kernel, so packets you filtered out
@@ -145,6 +147,109 @@ it (019). Jump targets are absolute, so it reads straight down.
 
 The same program runs over saved files too, interpreted in Python, so
 `pilotfish read -f ...` filters a capture file the same way.
+
+## Display filters
+
+A capture filter sees raw bytes and decides what is captured at all. A display
+filter runs after decoding, so it can ask about anything a dissector worked
+out, by field name, in the syntax Wireshark uses:
+
+```console
+$ uv run pilotfish read samples/wireshark-wiki/dns.cap -Y 'dns.flags.response == 1 and dns.qry.name contains "www"'
+    No.  Time                  Source                 Destination            Protocol  Length  Info
+     10  1112172558.734862000  192.168.170.20         192.168.170.8          DNS           90  Standard query response 0x75c0 A www.netbsd.org A 204.152.190.12
+     12  1112172575.698849000  192.168.170.20         192.168.170.8          DNS          102  Standard query response 0xf0d4 AAAA www.netbsd.org AAAA 2001:4f8:4:7:2e0:81ff:fe52:9a6b
+     14  1112172635.523827000  192.168.170.20         192.168.170.8          DNS          102  Standard query response 0x7f39 AAAA www.netbsd.org AAAA 2001:4f8:4:7:2e0:81ff:fe52:9a6b
+     16  1112172644.752428000  192.168.170.20         192.168.170.8          DNS           94  Standard query response 0x8db3 AAAA www.google.com CNAME www.l.google.com
+     18  1112172654.366527000  192.168.170.20         192.168.170.8          DNS           76  Standard query response 0xdca2 AAAA www.l.google.com
+     20  1112172695.437491000  192.168.170.20         192.168.170.8          DNS           75  Standard query response 0xbc1f AAAA www.example.com
+     22  1112172707.032976000  192.168.170.20         192.168.170.8          DNS           79  Standard query response 0x266d No such name AAAA www.example.notginh
+     24  1112172737.733384000  192.168.170.20         192.168.170.8          DNS          115  Standard query response 0xfee3 ANY www.isc.org AAAA 2001:4f8:0:2::d A 204.152.184.88
+```
+
+| Filter | Matches |
+|---|---|
+| `dns` | packets that have the protocol, or the field, at all |
+| `tcp.port >= 1024` | a comparison: `==` `!=` `<` `<=` `>` `>=`, or `eq` `ne` `lt` `le` `gt` `ge` |
+| `tcp and not (http or tls)` | `and` `or` `xor` `not`, or `&&` `\|\|` `^^` `!`, with brackets |
+| `ip.addr == 192.168.0.0/16` | either address inside a subnet |
+| `tcp.port in {80, 443, 8000..8080}` | any of a set of values and ranges, commas optional |
+| `http.host contains "example"` | text or bytes holding something |
+| `http.request.uri matches "\\.php$"` | a regular expression, ignoring case |
+| `eth.src[0:3] == 00:1a:2b` | a slice of a field's bytes: `[2]` `[0:3]` `[0-2]` `[-4:]` `[0,5]` |
+| `frame contains "password"` | anywhere in the packet, or in one protocol's bytes with `tcp contains` |
+| `tcp.flags & 0x12 == 0x12` | bits picked out with a mask |
+| `len(http.host) > 40`, `count(dns.a) > 1` | `len`, `count`, `lower` and `upper` |
+| `frame.time_epoch >= "2023-11-14 22:13:20"` | times, as seconds or as a UTC date |
+
+A packet has two addresses and two ports, so a field such as `ip.addr` or
+`tcp.port` stands for either. `ip.addr == 10.0.0.1` is true if either is, and
+`ip.addr != 10.0.0.1` only if neither is, which is what Wireshark 4 decided
+those should mean. `===` and `!==` ask the other way round.
+
+A filter that is wrong says what is wrong and points at it:
+
+```console
+$ uv run pilotfish read samples/wireshark-wiki/http.cap -Y 'ip.src == 145.254.160.300'
+pilotfish: display filter: ip.src is an IPv4 address, and 300 is too large for a part of one: each is 0 to 255
+    ip.src == 145.254.160.300
+                          ^~~
+$ uv run pilotfish read samples/wireshark-wiki/http.cap -Y 'tcp.prot == 80'
+pilotfish: display filter: no field is named "tcp.prot"; did you mean "tcp.port"?
+    tcp.prot == 80
+    ^~~~~~~~
+$ uv run pilotfish read samples/wireshark-wiki/http.cap -Y 'http.host matches "ethereal(\\.com"'
+pilotfish: display filter: this regular expression doesn't compile: missing ), unterminated subpattern
+    http.host matches "ethereal(\\.com"
+                               ^
+```
+
+It is a small compiler, in four stages:
+
+1. A **lexer** cuts the text into tokens that remember where they were
+   written. `80`, `tcp.port` and `192.168.0.0/16` are all just words at this
+   point, because what a word is depends on what it is compared with.
+2. A hand-written **Pratt parser** builds a syntax tree. One loop and a table
+   of binding powers handle all the precedence: `or`, then `xor`, then `and`,
+   then `not`, then comparisons.
+3. A **type checker** looks every word up in the field registry. A word that
+   names a field is a field; anything else is a value, and is read as the type
+   of the field beside it. That is where `ip.src == hello` stops, and where a
+   port can't `contains` anything.
+4. The typed tree is then run. An **evaluator** walks it for each packet, and a
+   **code generator** turns it into a Python function with the `ast` module and
+   `compile()`.
+
+`pilotfish filter` shows the middle of that without reading a capture:
+
+```console
+$ uv run pilotfish filter 'tcp.port == 80 and not dns'
+Parsed as    (and (== tcp.port 80) (not dns))
+Looks up     dns, tcp.dstport, tcp.srcport
+Compiled to  lambda found, data: any((n0.value == 80 for n0 in found['tcp.srcport'] + found['tcp.dstport'])) and (not found['dns'] != [])
+```
+
+The generated function gives the same answer as the tree walk, and gets
+there between 2.7 and 9.6 times faster over the twelve filters in
+`scripts/benchmark_display_filters.py`, 7 times at the median: about 0.2
+microseconds a packet instead of 1.5. What it saves is the deciding, done
+again for every packet, of what kind of node each one is. Both ways first
+find the filter's fields in the packet's tree, which takes about 2
+microseconds and is now most of what filtering costs. Decoding the packet in
+the first place takes about 60.
+
+The function is built as a Python syntax tree, never as source text, so
+nothing typed into a filter can run as code: its values go in as constants and
+its field names as dictionary keys.
+
+The suite has 466 filters of its own: 306 that are right, each with the
+packets it has to match, and 160 that are wrong, each with the message it has
+to give and the characters it has to point at.
+
+What a filter means is Wireshark's to say, so `tshark -Y` was run for 360
+filters over every sample capture pilotfish decodes, and its answers are kept
+beside them. The tests hold pilotfish to the same packets, filter by filter:
+7,200 comparisons over the captures in this repository.
 
 ## Following a stream
 
@@ -285,12 +390,14 @@ flowchart LR
   values in the captures kept here — along with which packet each message
   lands in. Random bytes are fuzzed through every dissector, and segments and
   fragments through reassembly in any order, to prove a bad packet can only
-  ever be marked malformed.
+  ever be marked malformed. Display filters are generated at random too, and
+  the compiled function has to agree with the tree walk on every one.
 
 | Path | Contents |
 |---|---|
 | `src/pilotfish/core/capture/` | libpcap binding, `/dev/bpf` reader, capture thread |
 | `src/pilotfish/core/filters/` | capture filters: instructions, disassembler, interpreter |
+| `src/pilotfish/core/display/` | display filters: lexer, parser, type checker, evaluator, code generator |
 | `src/pilotfish/core/dissect/` | the dissector framework |
 | `src/pilotfish/core/protocols/` | one module per protocol |
 | `src/pilotfish/core/reassembly/` | fragments and TCP streams, put back in order |
@@ -309,6 +416,7 @@ uv run pytest                                          # the test suite
 uv run ruff check && uv run ruff format --check        # lint and format
 uv run mypy                                            # types, strict
 uv run pytest tests/test_fuzz.py --hypothesis-profile=fuzz   # longer fuzzing
+uv run scripts/benchmark_display_filters.py            # tree walk against compiled
 ```
 
 Comparing against Wireshark's tools needs `brew install wireshark`, but the
@@ -331,6 +439,12 @@ tests don't: their output for each sample is saved in the repo. See
 - [x] Phase 7: TCP and UDP
 - [x] Phase 8: application protocols
 - [x] Phase 9: reassembling fragments and streams
+
+**Stage 3: Filters, command line and files**
+
+- [x] Phase 10: display filters
+- [ ] Phase 11: the command line tool
+- [ ] Phase 12: saving and exporting files
 
 ## Capture responsibly
 

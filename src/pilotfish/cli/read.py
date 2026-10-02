@@ -7,8 +7,10 @@ from typing import TextIO
 
 import pilotfish.core.protocols  # noqa: F401  (registers the dissectors)
 from pilotfish.cli.detail import write_tree
+from pilotfish.cli.explain import report
 from pilotfish.cli.table import PacketTable, TimeFormat
 from pilotfish.core.capture import MAX_SNAPLEN, compile_filter
+from pilotfish.core.display import DisplayFilterError, compile_display_filter
 from pilotfish.core.dissect import Session, dissect
 from pilotfish.core.filters import FilterError, Program, machine
 from pilotfish.core.formats import CaptureFile, CaptureFileError
@@ -21,6 +23,7 @@ def run(
     time_format: TimeFormat,
     *,
     filter_text: str | None = None,
+    display_text: str | None = None,
     tree: bool = False,
     out: TextIO | None = None,
 ) -> int:
@@ -29,8 +32,20 @@ def run(
     With ``tree``, print each packet's protocol tree instead, as tshark's -V
     does. With a capture filter, packets it doesn't match are left out. They
     keep their numbers in the file, as tshark's do.
+
+    A display filter leaves packets out as well, but only after they have
+    been decoded, since what it asks about is what they decoded into. So the
+    packets it hides still count towards what the ones it shows say: a
+    retransmission is one whether or not the original is listed.
     """
     out = out or sys.stdout
+    display = None
+    if display_text is not None:
+        try:
+            display = compile_display_filter(display_text)
+        except DisplayFilterError as error:
+            report(error)
+            return 1
     try:
         capture = CaptureFile(path)
     except (OSError, CaptureFileError) as error:
@@ -59,8 +74,10 @@ def run(
             for number, packet in rest:
                 if filter_text is not None and not _matches(packet, filter_text, programs):
                     continue
-                shown += 1
                 decoded = dissect(packet, number, session=session)
+                if display is not None and not display.matches(decoded, packet.data):
+                    continue
+                shown += 1
                 if not tree:
                     table.write_row(number, packet, decoded)
                     continue

@@ -42,6 +42,7 @@ class Ethernet(Dissector):
     fields = (
         Field("eth.dst", FieldType.ETHERNET, "Destination"),
         Field("eth.src", FieldType.ETHERNET, "Source"),
+        Field("eth.addr", FieldType.ETHERNET, "Address", either=("eth.src", "eth.dst")),
         Field("eth.type", FieldType.UINT, "Type", hex=True),
         Field("eth.len", FieldType.UINT, "Length"),
     )

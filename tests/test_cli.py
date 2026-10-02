@@ -261,3 +261,121 @@ def test_read_names_a_fragment_by_the_protocol_that_was_cut_up(
         *["IPv4", "IPv4", "UDP", "IPv4"],
         *["IPv6", "ICMPv6"] * 2,
     ]
+
+
+SAMPLES = Path(__file__).resolve().parent.parent / "samples"
+
+
+def test_read_with_a_display_filter(capsys: pytest.CaptureFixture[str]) -> None:
+    capture = SAMPLES / "wireshark-wiki" / "http.cap"
+    assert main(["read", "-Y", "http or dns", str(capture)]) == 0
+    listed = capsys.readouterr().out.splitlines()
+    # The packets tshark -Y lists, under the numbers they have in the file.
+    assert [line.split()[0] for line in listed[1:]] == ["4", "13", "17", "18", "27", "38"]
+    assert [line.split()[4] for line in listed[1:]] == [
+        *["HTTP", "DNS", "DNS", "HTTP", "HTTP", "HTTP"],
+    ]
+
+
+def test_a_display_filter_hides_packets_without_forgetting_them(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Packets that aren't listed still count towards what the others say.
+
+    The retransmission in packet 6 is one because of packet 4, which this
+    filter leaves out, and its sequence number is still counted from the
+    handshake, which it leaves out as well.
+    """
+    capture = SAMPLES / "made" / "tcp.pcap"
+    assert main(["read", "-Y", "tcp.analysis.retransmission", str(capture)]) == 0
+    listed = capsys.readouterr().out.splitlines()[1:]
+    assert listed[0].split()[0] == "6"
+    assert "[TCP Retransmission] 50000 → 80 [PSH, ACK] Seq=101 " in listed[0]
+
+
+def test_a_display_filter_narrows_the_detail_view_too(capsys: pytest.CaptureFixture[str]) -> None:
+    capture = SAMPLES / "wireshark-wiki" / "dns.cap"
+    assert main(["read", "-V", "-Y", "frame.number in {2, 4}", str(capture)]) == 0
+    listed = capsys.readouterr().out
+    assert listed.startswith("Frame 2: ")
+    assert listed.count("\nFrame ") == 1
+    assert "\n\nFrame 4: " in listed
+
+
+def test_an_empty_display_filter_lists_everything(capsys: pytest.CaptureFixture[str]) -> None:
+    capture = SAMPLES / "wireshark-wiki" / "dns.cap"
+    assert main(["read", "-Y", "", str(capture)]) == 0
+    assert len(capsys.readouterr().out.splitlines()) == 1 + 38
+
+
+@pytest.mark.macos
+def test_a_capture_filter_and_a_display_filter_both_apply(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    capture = SAMPLES / "wireshark-wiki" / "http.cap"
+    assert main(["read", "-f", "udp", "-Y", "dns.flags.response == 1", str(capture)]) == 0
+    listed = capsys.readouterr().out.splitlines()
+    assert [line.split()[0] for line in listed[1:]] == ["17"]
+
+
+def test_a_display_filter_that_is_wrong_says_where(capsys: pytest.CaptureFixture[str]) -> None:
+    capture = SAMPLES / "wireshark-wiki" / "http.cap"
+    assert main(["read", "-Y", "ip.src == hello", str(capture)]) == 1
+    output = capsys.readouterr()
+    assert output.out == ""  # the error comes before any listing
+    assert output.err == (
+        'pilotfish: display filter: ip.src is an IPv4 address, and "hello" isn\'t one\n'
+        "    ip.src == hello\n"
+        "              ^~~~~\n"
+    )
+
+
+def test_a_wrong_display_filter_is_reported_before_the_file_is_opened(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["read", "-Y", "tcp.port ==", str(tmp_path / "missing.pcap")]) == 1
+    assert capsys.readouterr().err == (
+        "pilotfish: display filter: the filter ends where a field or a value was expected\n"
+        "    tcp.port ==\n"
+        "               ^\n"
+    )
+
+
+def test_filter_shows_what_a_display_filter_compiles_to(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["filter", "tcp.port in {80, 443} and not ip.addr == 10.0.0.0/8"]) == 0
+    assert capsys.readouterr().out == (
+        "Parsed as    (and (in tcp.port {80 443}) (not (== ip.addr 10.0.0.0/8)))\n"
+        "Looks up     ip.dst, ip.src, tcp.dstport, tcp.srcport\n"
+        "Compiled to  lambda found, data: any((n0.value in _k0 for n0 in "
+        "found['tcp.srcport'] + found['tcp.dstport'])) and (not any((_k1 <= n1.value <= _k2 "
+        "for n1 in found['ip.src'] + found['ip.dst'])))\n"
+        "  where      _k0 = frozenset({80, 443})\n"
+        "  where      _k1 = IPv4Address('10.0.0.0')\n"
+        "  where      _k2 = IPv4Address('10.255.255.255')\n"
+    )
+
+
+def test_filter_says_what_is_wrong_with_a_filter(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["filter", "eth.src[0:3] == 00:1a:2g"]) == 1
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert output.err == (
+        'pilotfish: display filter: "2g" isn\'t a byte; each one is two hexadecimal digits, '
+        "as in 00:1a:2b\n"
+        "    eth.src[0:3] == 00:1a:2g\n"
+        "                          ^~\n"
+    )
+
+
+def test_filter_accepts_an_empty_filter(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["filter", ""]) == 0
+    assert capsys.readouterr().out == "An empty filter, which every packet passes.\n"
+
+
+def test_fields_lists_the_names_that_stand_for_two(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["fields"]) == 0
+    listed = [line.split(maxsplit=2) for line in capsys.readouterr().out.splitlines()]
+    assert ["ip.addr", "ipv4", "Source or Destination Address"] in listed
+    assert ["tcp.port", "uint", "Source or Destination Port"] in listed

@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from pilotfish import __version__
-from pilotfish.cli import capture, fields, follow, interfaces, read
+from pilotfish.cli import capture, explain, fields, follow, interfaces, read
 from pilotfish.cli.table import TIME_FORMATS
 from pilotfish.core.capture import DEFAULT_QUEUE_SIZE, MAX_SNAPLEN, CaptureOptions
 
@@ -72,6 +72,14 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="EXPRESSION",
         help="list only the packets a capture filter keeps, such as 'udp port 53'; "
         "pilotfish runs the compiled program itself",
+    )
+    read_parser.add_argument(
+        "-Y",
+        "--display-filter",
+        metavar="EXPRESSION",
+        help="list only the packets a display filter matches, such as "
+        "'tcp.port == 443 and not ip.addr == 10.0.0.0/8'; it asks about decoded "
+        "fields, which `pilotfish fields` lists",
     )
     _add_time_format(read_parser)
 
@@ -167,6 +175,15 @@ def build_parser() -> argparse.ArgumentParser:
         "to save to a file or pipe into a hash",
     )
 
+    filter_parser = commands.add_parser(
+        "filter",
+        help="check a display filter and show what it compiles to",
+        description="Check a display filter without reading a capture. Prints how "
+        "the filter was parsed, the fields it looks up and the Python function it "
+        "was compiled to, or what is wrong with it and where.",
+    )
+    filter_parser.add_argument("expression", help="display filter, such as 'tcp.port == 80'")
+
     commands.add_parser(
         "fields",
         help="list the fields pilotfish can decode",
@@ -187,7 +204,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "read":
-            return read.run(args.file, args.time_format, filter_text=args.filter, tree=args.tree)
+            return read.run(
+                args.file,
+                args.time_format,
+                filter_text=args.filter,
+                display_text=args.display_filter,
+                tree=args.tree,
+            )
         if args.command == "capture":
             if args.print_filter and args.filter is None:
                 parser.error("--print-filter needs a filter to print: pass -f EXPRESSION")
@@ -209,6 +232,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         if args.command == "follow":
             return follow.run(args.file, args.stream, raw=args.raw)
+        if args.command == "filter":
+            return explain.run(args.expression)
         if args.command == "fields":
             return fields.run()
         if args.command == "interfaces":

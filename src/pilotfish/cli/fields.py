@@ -9,8 +9,8 @@ from pilotfish.core.dissect import REGISTRY, FieldRegistry
 def run(out: TextIO | None = None, registry: FieldRegistry | None = None) -> int:
     """Print each field's name, type and description, in name order.
 
-    These are the names a display filter will use, so this is the list of
-    what pilotfish can decode and, later, filter on.
+    These are the names a display filter uses, so this is the list of what
+    pilotfish can decode and filter on.
     """
     out = out or sys.stdout
     fields = list(registry if registry is not None else REGISTRY.fields)

@@ -73,6 +73,12 @@ class IPv4(Dissector):
         Field("ip.checksum.status", FieldType.UINT, "Header checksum status"),
         Field("ip.src", FieldType.IPV4, "Source Address"),
         Field("ip.dst", FieldType.IPV4, "Destination Address"),
+        Field(
+            "ip.addr",
+            FieldType.IPV4,
+            "Source or Destination Address",
+            either=("ip.src", "ip.dst"),
+        ),
         Field("ip.opt.type", FieldType.UINT, "Type"),
         Field("ip.opt.type.copy", FieldType.BOOL, "Copy on fragmentation"),
         Field("ip.opt.type.class", FieldType.UINT, "Class"),

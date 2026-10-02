@@ -38,6 +38,12 @@ class Udp(Dissector):
     fields = (
         Field("udp.srcport", FieldType.UINT, "Source Port"),
         Field("udp.dstport", FieldType.UINT, "Destination Port"),
+        Field(
+            "udp.port",
+            FieldType.UINT,
+            "Source or Destination Port",
+            either=("udp.srcport", "udp.dstport"),
+        ),
         Field("udp.length", FieldType.UINT, "Length"),
         Field("udp.checksum", FieldType.UINT, "Checksum", hex=True),
         Field("udp.checksum.status", FieldType.UINT, "Checksum status"),

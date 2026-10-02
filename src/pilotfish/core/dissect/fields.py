@@ -1,8 +1,8 @@
 """Every field a dissector can produce, by name.
 
 A field name such as ``ip.src`` means the same thing wherever it appears: in
-the protocol tree, in the detail view, and in the display filters of a later
-phase, which are type checked against this registry.
+the protocol tree, in the detail view, and in display filters, which are type
+checked against this registry.
 """
 
 from collections.abc import Iterator
@@ -47,6 +47,11 @@ class Field:
     digits: int = 0
     """How many hexadecimal digits to show, for a field that doesn't fill the
     bytes it is read from. Zero means as many as those bytes hold."""
+    either: tuple[str, ...] = ()
+    """The fields this one is another name for, when it stands for several:
+    ``ip.addr`` is either ``ip.src`` or ``ip.dst``. No dissector reads a field
+    like this, so it is never in a tree. A display filter that names it looks
+    for the fields it stands for."""
 
     @property
     def protocol(self) -> str:
@@ -74,6 +79,12 @@ class FieldRegistry:
             return self._fields[name]
         except KeyError:
             raise KeyError(f"no field named {name!r} is registered") from None
+
+    def found_as(self, name: str) -> tuple[str, ...]:
+        """The names a field's values go by in a tree: its own, or for a
+        field that stands for several, theirs."""
+        field = self[name]
+        return field.either or (field.name,)
 
     def __contains__(self, name: object) -> bool:
         return name in self._fields

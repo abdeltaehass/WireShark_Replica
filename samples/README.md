@@ -1,7 +1,7 @@
 # Sample captures
 
-Capture files for the tests. Next to each one are two answer keys recorded
-from Wireshark's own tools by `scripts/update_answer_keys.py`:
+Capture files for the tests. Next to each one are answer keys recorded from
+Wireshark's own tools by `scripts/update_answer_keys.py`:
 
 - `<file>.tshark.tsv`: tshark's time, length, captured length and interface
   for every packet
@@ -9,9 +9,30 @@ from Wireshark's own tools by `scripts/update_answer_keys.py`:
 - `<file>.tshark.json.gz`: every field tshark decodes, gzipped because it is
   large. The dissector tests compare field values against it. Captures that
   only exercise the file format don't have one.
+- `<file>.filters.json`: the packets `tshark -Y` matches for each display
+  filter listed in `display-filters.txt`, written as runs such as `1-3,7`.
+  `tests/test_display_tshark.py` holds pilotfish's display filters to them.
 
-`tests/test_samples.py` checks pilotfish against both, so CI doesn't need
-Wireshark installed.
+The tests check pilotfish against all of these, so CI doesn't need Wireshark
+installed.
+
+## Display filters
+
+`display-filters.txt` is the list of filters tshark is asked about, one per
+line. Each has to be valid in Wireshark and use only fields pilotfish decodes.
+After adding one, record its answers for every capture, which takes a couple
+of minutes:
+
+```sh
+uv run scripts/update_answer_keys.py --filters
+```
+
+Two things to know when a filter's answers surprise you. Wireshark knows far
+more fields than pilotfish, so a short hexadecimal value can be a field's name
+there: `ff` is one, which makes `eth.dst[0] == ff` a comparison of two fields.
+And when both sides of a comparison are slices that reach past the end of
+their field, Wireshark calls them equal, where pilotfish says a slice that
+doesn't fit has no value to compare.
 
 ## Sources
 
