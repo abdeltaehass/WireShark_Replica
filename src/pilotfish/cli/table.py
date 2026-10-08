@@ -18,8 +18,8 @@ _PROTOCOL_WIDTH = 8
 # Where the addresses in the packet list come from, innermost first: the
 # network layer when there is one, and the link layer otherwise, which is
 # what Wireshark shows for ARP.
-_SOURCES = ("ipv6.src", "ip.src", "eth.src")
-_DESTINATIONS = ("ipv6.dst", "ip.dst", "eth.dst")
+SOURCES = ("ipv6.src", "ip.src", "eth.src")
+DESTINATIONS = ("ipv6.dst", "ip.dst", "eth.dst")
 
 # Protocols whose column name isn't just their name in capitals.
 _ABBREVIATIONS = {"ip": "IPv4", "ipv6": "IPv6", "icmpv6": "ICMPv6"}
@@ -44,8 +44,8 @@ class PacketTable:
         ns = packet.timestamp_ns
         time = "-" if ns is None else self._format_time(ns)
         self._out.write(
-            f"{number:>7}  {time:<{self._width}}  {address(tree, _SOURCES):<{_ADDRESS_WIDTH}}  "
-            f"{address(tree, _DESTINATIONS):<{_ADDRESS_WIDTH}}  "
+            f"{number:>7}  {time:<{self._width}}  {address(tree, SOURCES):<{_ADDRESS_WIDTH}}  "
+            f"{address(tree, DESTINATIONS):<{_ADDRESS_WIDTH}}  "
             f"{protocol(tree):<{_PROTOCOL_WIDTH}}  {packet.original_length:>6}  "
             f"{summary(tree)}\n".rstrip(" ")
         )

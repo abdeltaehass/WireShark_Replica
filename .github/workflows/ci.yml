@@ -44,7 +44,8 @@ jobs:
       - name: Smoke test the command line tool
         run: |
           uv run pilotfish --version
-          uv run pilotfish interfaces
+          uv run pilotfish -D
+          uv run pilotfish -r samples/wireshark-wiki/dns.cap -Y dns -T json | jq length
 
   # Parsers work on bytes and never touch the OS, so they run on Linux too.
   # This job installs no extras, which also proves the core installs without Qt.

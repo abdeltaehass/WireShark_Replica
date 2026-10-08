@@ -12,6 +12,7 @@ from loopback import LoopbackTraffic
 from packets import DNS_OVER_ETHERNET, DNS_OVER_ETHERNET_IMAGE
 from pilotfish.cli import capture, interfaces
 from pilotfish.cli.main import main
+from pilotfish.cli.status import Exit
 from pilotfish.core.capture import (
     CaptureOptions,
     CapturePermissionError,
@@ -109,7 +110,7 @@ def test_restores_the_ctrl_c_handler() -> None:
 def test_capture_error_after_some_packets() -> None:
     source = FakeSource([fake_packet(number) for number in range(1, 6)], fail_after=2)
     out, err = io.StringIO(), io.StringIO()
-    assert capture.run(source, out=out, err=err) == 1
+    assert capture.run(source, out=out, err=err) == Exit.CAPTURE_ERROR
     assert out.getvalue() == HEADER + row(1) + row(2)
     assert err.getvalue().startswith("2 packets captured\n")
     assert err.getvalue().endswith("pilotfish: fake0: the interface went away\n")
@@ -160,9 +161,9 @@ def test_command_explains_permission_errors(
         raise CapturePermissionError(f"{interface}: /dev/bpf0: Permission denied")
 
     use_sources(monkeypatch, open_source)
-    assert main(["capture"]) == 1
+    assert main(["capture"]) == Exit.NO_PERMISSION
     assert capsys.readouterr().err == (
-        f"pilotfish: fake0: /dev/bpf0: Permission denied\npilotfish: {capture.PERMISSION_HINT}\n"
+        f"pilotfish: fake0: /dev/bpf0: Permission denied\n    {capture.PERMISSION_HINT}\n"
     )
 
 
@@ -170,7 +171,7 @@ def test_command_explains_permission_errors(
 def test_rejects_bad_snapshot_lengths(length: str, capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit) as exc_info:
         main(["capture", "-s", length])
-    assert exc_info.value.code == 2
+    assert exc_info.value.code == Exit.INVALID_OPTION
     assert "--snapshot-length" in capsys.readouterr().err
 
 
@@ -235,10 +236,10 @@ def test_print_filter_prints_the_program(
 
 
 def test_print_filter_needs_a_filter(capsys: pytest.CaptureFixture[str]) -> None:
-    with pytest.raises(SystemExit) as exc_info:
-        main(["capture", "-d"])
-    assert exc_info.value.code == 2
-    assert "--print-filter needs a filter" in capsys.readouterr().err
+    assert main(["capture", "-d"]) == Exit.INVALID_OPTION
+    assert capsys.readouterr().err == (
+        "pilotfish: -d prints a capture filter's program; give the filter with -f\n"
+    )
 
 
 def test_the_filter_reaches_the_source(
@@ -263,7 +264,7 @@ def test_a_filter_that_will_not_compile(
         raise FilterError('capture filter "udp porrt 53": syntax error')
 
     use_sources(monkeypatch, open_source)
-    assert main(["capture", "-f", "udp porrt 53"]) == 1
+    assert main(["capture", "-f", "udp porrt 53"]) == Exit.INVALID_FILTER
     assert capsys.readouterr().err == ('pilotfish: capture filter "udp porrt 53": syntax error\n')
 
 

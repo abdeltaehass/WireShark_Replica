@@ -12,6 +12,7 @@ from pilotfish import __version__
 from pilotfish.cli import fields
 from pilotfish.cli.detail import write_tree
 from pilotfish.cli.main import main
+from pilotfish.cli.status import Exit
 from pilotfish.core.dissect import Field, FieldRegistry, FieldType, ProtocolTree, dissect
 from pilotfish.core.packet import Packet
 from toy import toy_packet
@@ -71,7 +72,7 @@ def test_read_in_utc(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None
 
 def test_read_reports_a_missing_file(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     missing = tmp_path / "missing.pcap"
-    assert main(["read", str(missing)]) == 1
+    assert main(["read", str(missing)]) == Exit.INVALID_FILE
     assert capsys.readouterr().err == f"pilotfish: {missing}: No such file or directory\n"
 
 
@@ -81,7 +82,8 @@ def test_read_prints_packets_before_a_truncation(
     capture = write_pcap(
         tmp_path / "cut.pcap", pcap_record("<", 0, 0, b"whole"), pcap_record("<", 0, 0, b"cut")[:-1]
     )
-    assert main(["read", str(capture)]) == 1
+    # Some packets were printed before the damage, so it is a read error, not a bad file.
+    assert main(["read", str(capture)]) == Exit.READ_ERROR
     output = capsys.readouterr()
     assert output.out.count("\n") == 2  # header and the one whole packet
     assert "is cut short: 2 of 3 bytes" in output.err
@@ -107,7 +109,7 @@ def test_read_with_a_filter_that_will_not_compile(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     capture = write_pcap(tmp_path / "one.pcap", pcap_record("<", 1, 0, ethernet(ipv4(udp(1, 53)))))
-    assert main(["read", "-f", "udp porrt 53", str(capture)]) == 1
+    assert main(["read", "-f", "udp porrt 53", str(capture)]) == Exit.INVALID_FILTER
     output = capsys.readouterr()
     assert output.out == ""  # the error comes before any listing
     assert output.err == (
@@ -320,7 +322,7 @@ def test_a_capture_filter_and_a_display_filter_both_apply(
 
 def test_a_display_filter_that_is_wrong_says_where(capsys: pytest.CaptureFixture[str]) -> None:
     capture = SAMPLES / "wireshark-wiki" / "http.cap"
-    assert main(["read", "-Y", "ip.src == hello", str(capture)]) == 1
+    assert main(["read", "-Y", "ip.src == hello", str(capture)]) == Exit.INVALID_FILTER
     output = capsys.readouterr()
     assert output.out == ""  # the error comes before any listing
     assert output.err == (
@@ -333,7 +335,7 @@ def test_a_display_filter_that_is_wrong_says_where(capsys: pytest.CaptureFixture
 def test_a_wrong_display_filter_is_reported_before_the_file_is_opened(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    assert main(["read", "-Y", "tcp.port ==", str(tmp_path / "missing.pcap")]) == 1
+    assert main(["read", "-Y", "tcp.port ==", str(tmp_path / "missing.pcap")]) == 4
     assert capsys.readouterr().err == (
         "pilotfish: display filter: the filter ends where a field or a value was expected\n"
         "    tcp.port ==\n"
@@ -358,7 +360,7 @@ def test_filter_shows_what_a_display_filter_compiles_to(
 
 
 def test_filter_says_what_is_wrong_with_a_filter(capsys: pytest.CaptureFixture[str]) -> None:
-    assert main(["filter", "eth.src[0:3] == 00:1a:2g"]) == 1
+    assert main(["filter", "eth.src[0:3] == 00:1a:2g"]) == Exit.INVALID_FILTER
     output = capsys.readouterr()
     assert output.out == ""
     assert output.err == (

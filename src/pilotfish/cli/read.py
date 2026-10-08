@@ -1,60 +1,58 @@
-"""``pilotfish read``: list the packets in a capture file."""
+"""Reading a capture file: ``pilotfish -r FILE``, or ``pilotfish read FILE``."""
 
 import sys
 from itertools import chain
-from pathlib import Path
 from typing import TextIO
 
-import pilotfish.core.protocols  # noqa: F401  (registers the dissectors)
-from pilotfish.cli.detail import write_tree
-from pilotfish.cli.explain import report
-from pilotfish.cli.table import PacketTable, TimeFormat
+from pilotfish.cli.pipeline import Pipeline
+from pilotfish.cli.status import CommandError, Exit
 from pilotfish.core.capture import MAX_SNAPLEN, compile_filter
-from pilotfish.core.display import DisplayFilterError, compile_display_filter
-from pilotfish.core.dissect import Session, dissect
 from pilotfish.core.filters import FilterError, Program, machine
 from pilotfish.core.formats import CaptureFile, CaptureFileError
 from pilotfish.core.linktypes import dlt_from_link_type
 from pilotfish.core.packet import Packet
 
+STANDARD_INPUT = "-"
+
+
+def open_capture(path: str) -> CaptureFile:
+    """The capture file to read.
+
+    ``-`` is standard input, so a capture can be piped in. It is read to its
+    end before the first packet is decoded.
+    """
+    name = "standard input" if path == STANDARD_INPUT else path
+    try:
+        if path == STANDARD_INPUT:
+            return CaptureFile.from_bytes(sys.stdin.buffer.read(), name)
+        return CaptureFile(path)
+    except OSError as error:
+        raise CommandError(Exit.INVALID_FILE, f"{name}: {error.strerror or error}") from None
+    except CaptureFileError as error:
+        raise CommandError(Exit.INVALID_FILE, f"{name}: {error}") from None
+
 
 def run(
-    path: Path,
-    time_format: TimeFormat,
+    capture: CaptureFile,
+    pipeline: Pipeline,
     *,
     filter_text: str | None = None,
-    display_text: str | None = None,
-    tree: bool = False,
+    count: int | None = None,
+    print_filter: bool = False,
     out: TextIO | None = None,
-) -> int:
-    """Print one line per packet: number, timestamp, lengths and link type.
+) -> Exit:
+    """Hand every packet of the file to ``pipeline``, numbered from 1.
 
-    With ``tree``, print each packet's protocol tree instead, as tshark's -V
-    does. With a capture filter, packets it doesn't match are left out. They
-    keep their numbers in the file, as tshark's do.
+    A capture filter leaves out the packets it doesn't match before they are
+    decoded. They keep their numbers in the file, as tshark's do. ``count``
+    stops after that many packets have been read, matched or not, which is
+    what tshark's -c does too.
 
-    A display filter leaves packets out as well, but only after they have
-    been decoded, since what it asks about is what they decoded into. So the
-    packets it hides still count towards what the ones it shows say: a
-    retransmission is one whether or not the original is listed.
+    A file that turns out to be cut short ends the output cleanly, after
+    the packets before the damage, and then fails.
     """
     out = out or sys.stdout
-    display = None
-    if display_text is not None:
-        try:
-            display = compile_display_filter(display_text)
-        except DisplayFilterError as error:
-            report(error)
-            return 1
-    try:
-        capture = CaptureFile(path)
-    except (OSError, CaptureFileError) as error:
-        return _fail(path, error)
-
-    table = PacketTable(out, time_format)
-    # One session for the whole file, so a dissector that follows connections
-    # sees the packets before this one.
-    session = Session()
+    name = str(capture.path)
     # A pcapng file can hold interfaces with different link types, and a
     # filter has to be compiled for each of them.
     programs: dict[int, Program] = {}
@@ -63,35 +61,30 @@ def run(
         try:
             # Compiling the filter needs a link type, so it waits for the
             # first packet, and a filter that won't compile says so before any
-            # of the listing is printed.
+            # of the output is printed.
             first = next(packets, None)
-            if first is not None and filter_text is not None:
-                _program_for(first[1].link_type, filter_text, programs)
-            if not tree:
-                table.write_header()
-            rest = packets if first is None else chain([first], packets)
-            shown = 0
-            for number, packet in rest:
+        except CaptureFileError as error:
+            raise CommandError(Exit.READ_ERROR, f"{name}: {error}") from None
+        if filter_text is not None:
+            link_type = 1 if first is None else first[1].link_type
+            program = _program_for(link_type, filter_text, programs)
+            if print_filter:
+                for line in program.disassemble():
+                    out.write(f"{line}\n")
+                return Exit.OK
+        pipeline.begin()
+        try:
+            for number, packet in packets if first is None else chain([first], packets):
+                if count is not None and number > count:
+                    break
                 if filter_text is not None and not _matches(packet, filter_text, programs):
                     continue
-                decoded = dissect(packet, number, session=session)
-                if display is not None and not display.matches(decoded, packet.data):
-                    continue
-                shown += 1
-                if not tree:
-                    table.write_row(number, packet, decoded)
-                    continue
-                if shown > 1:
-                    out.write("\n")
-                write_tree(decoded, out)
+                pipeline.packet(number, packet)
         except CaptureFileError as error:
-            out.flush()
-            return _fail(path, error)
-        except FilterError as error:
-            out.flush()
-            print(f"pilotfish: {error}", file=sys.stderr)
-            return 1
-    return 0
+            raise CommandError(Exit.READ_ERROR, f"{name}: {error}") from None
+        finally:
+            pipeline.end()
+    return Exit.OK
 
 
 def _matches(packet: Packet, filter_text: str, programs: dict[int, Program]) -> bool:
@@ -103,12 +96,9 @@ def _matches(packet: Packet, filter_text: str, programs: dict[int, Program]) -> 
 def _program_for(link_type: int, filter_text: str, programs: dict[int, Program]) -> Program:
     program = programs.get(link_type)
     if program is None:
-        program = compile_filter(filter_text, dlt_from_link_type(link_type), MAX_SNAPLEN)
+        try:
+            program = compile_filter(filter_text, dlt_from_link_type(link_type), MAX_SNAPLEN)
+        except FilterError as error:
+            raise CommandError(Exit.INVALID_FILTER, str(error)) from None
         programs[link_type] = program
     return program
-
-
-def _fail(path: Path, error: OSError | CaptureFileError) -> int:
-    reason = error.strerror if isinstance(error, OSError) and error.strerror else str(error)
-    print(f"pilotfish: {path}: {reason}", file=sys.stderr)
-    return 1

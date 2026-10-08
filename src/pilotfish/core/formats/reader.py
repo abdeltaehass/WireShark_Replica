@@ -51,7 +51,7 @@ class CaptureFile:
                 raise CaptureFileError("file is empty")
             # The mapping keeps its own reference to the file, so the file
             # object can be closed straight away.
-            self._mmap = mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ)
+            self._mmap: mmap.mmap | None = mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ)
         try:
             self._reader = reader_for(self._mmap)
         except CaptureFileError:
@@ -60,6 +60,21 @@ class CaptureFile:
         self.format = (
             FileFormat.PCAPNG if isinstance(self._reader, PcapngReader) else FileFormat.PCAP
         )
+
+    @classmethod
+    def from_bytes(cls, data: bytes, name: str = "-") -> "CaptureFile":
+        """A capture held in memory rather than in a file, such as one read
+        from a pipe. ``name`` is what to call it in messages."""
+        if not data:
+            raise CaptureFileError("file is empty")
+        capture = cls.__new__(cls)
+        capture.path = Path(name)
+        capture._mmap = None
+        capture._reader = reader_for(data)
+        capture.format = (
+            FileFormat.PCAPNG if isinstance(capture._reader, PcapngReader) else FileFormat.PCAP
+        )
+        return capture
 
     def __iter__(self) -> Iterator[Packet]:
         return iter(self._reader)
@@ -71,8 +86,9 @@ class CaptureFile:
     def _close_mapping(self) -> None:
         # Packets still in use hold views into the mapping, and mmap refuses to
         # close while they exist. The mapping is then freed with the last of them.
-        with contextlib.suppress(BufferError):
-            self._mmap.close()
+        if self._mmap is not None:
+            with contextlib.suppress(BufferError):
+                self._mmap.close()
 
     def __enter__(self) -> Self:
         return self

@@ -12,7 +12,8 @@ against real tshark output.
 **Status:** captures, filters and decodes from the link layer up to DNS, DHCP,
 HTTP, TLS and SSH, puts messages that span packets back together, follows a
 TCP stream from end to end, and picks packets out with display filters in
-Wireshark's syntax.
+Wireshark's syntax. The command line tool takes tshark's flags, prints JSON,
+fields and hex dumps, and saves pcap and pcapng files.
 
 ## Install
 
@@ -25,10 +26,16 @@ uv sync --all-extras
 uv run pilotfish --version
 ```
 
-## Reading a file
+To have `pilotfish` on your PATH outside the project, install it with
+[pipx](https://pipx.pypa.io/): `pipx install .` from the clone.
+
+## Using it
+
+pilotfish takes tshark's flags. `-r` reads a capture file, `-i` captures
+live, and the rest decide what happens to the packets either way:
 
 ```console
-$ uv run pilotfish read samples/wireshark-wiki/dns.cap
+$ uv run pilotfish -r samples/wireshark-wiki/dns.cap
     No.  Time                  Source                 Destination            Protocol  Length  Info
       1  1112172466.496046000  192.168.170.8          192.168.170.20         DNS           70  Standard query 0x1032 TXT google.com
       2  1112172466.496576000  192.168.170.20         192.168.170.8          DNS           98  Standard query response 0x1032 TXT google.com TXT
@@ -39,19 +46,31 @@ The columns are tshark's: who sent it, who to, the innermost protocol
 decoded, and a one-line summary. A packet that doesn't hold what its headers
 claim is listed with `[Malformed Packet]` instead of being dropped.
 
-Useful flags:
-
 | Flag | What it does |
 |---|---|
-| `-V` | print each packet's full protocol tree |
-| `-Y 'tcp.port == 443'` | list only the packets a display filter matches |
-| `-f 'udp port 53'` | keep only the packets a capture filter matches |
-| `--time-format utc` | dates instead of epoch seconds |
+| `-r FILE` | read a pcap or pcapng file, or standard input with `-r -` |
+| `-i en0` | capture live; with neither `-r` nor `-i`, on the first connected interface |
+| `-c N` | stop after N packets |
+| `-Y 'tcp.port == 443'` | keep only the packets a [display filter](#display-filters) matches |
+| `-f 'udp port 53'` | keep only the packets a [capture filter](#capture-filters) matches |
+| `-V` | print each packet's protocol tree |
+| `-x` | print each packet's bytes as a hex dump |
+| `-T json` | print every packet as JSON |
+| `-T fields -e ip.src -e dns.qry.name` | print the fields you name, one line per packet |
+| `-w out.pcapng` | save the packets kept; `-F pcap` for pcap, `-w -` for standard output |
+| `-q`, `-P`, `-l` | print nothing; print while saving; send each packet on at once |
+| `-D` | list the interfaces to capture on |
+| `-t utc` | dates instead of epoch seconds |
+
+`pilotfish read FILE` and `pilotfish capture` say the same as `-r FILE` and
+`-i`, and take the same flags. `pilotfish --help` lists everything.
+
+### The protocol tree
 
 `-V` prints a tree like Wireshark's detail pane:
 
 ```console
-$ uv run pilotfish read -V samples/made/mdns.pcap
+$ uv run pilotfish -r samples/made/mdns.pcap -V
 Frame 1: 111 bytes on wire, 111 bytes captured
     Frame number: 1
     ...
@@ -75,10 +94,106 @@ Multicast Domain Name System (query)
 types. They are Wireshark's names, so `ip.src`, `tcp.flags` and
 `dns.qry.name` mean here what they mean there.
 
+### JSON and fields, for other programs
+
+`-T json` prints the layout tshark prints, so whatever reads tshark's JSON
+reads pilotfish's, and jq takes it straight from the pipe:
+
+```console
+$ uv run pilotfish -r samples/wireshark-wiki/dns.cap -Y "dns.flags.response == 1" -T json \
+    | jq '.[0]._source.layers.dns | {"dns.qry.name", "dns.txt", "dns.time"}'
+{
+  "dns.qry.name": "google.com",
+  "dns.txt": "v=spf1 ptr ?all",
+  "dns.time": "0.000530000"
+}
+```
+
+Each layer is an object under `_source.layers`, every value is text, and a
+field's own fields are under `<name>_tree`. A field that appears more than
+once in a packet comes out as a list, which is what tshark does with
+`--no-duplicate-keys`; without it tshark repeats the key, and most JSON
+readers keep only the last. Add `-e` to print only the fields named.
+
+`-T fields` prints a column for each `-e`, several values of one field joined
+by commas:
+
+```console
+$ uv run pilotfish -r samples/wireshark-wiki/dns.cap -c 4 -T fields -E header=y \
+    -e frame.number -e ip.src -e dns.qry.type -e dns.qry.name -e dns.a
+frame.number	ip.src	dns.qry.type	dns.qry.name	dns.a
+1	192.168.170.8	16	google.com
+2	192.168.170.20	16	google.com
+3	192.168.170.8	15	google.com
+4	192.168.170.20	15	google.com	216.239.37.26,64.233.167.25,66.102.9.25,216.239.57.25,216.239.37.25,216.239.57.26
+```
+
+`-E` takes tshark's layout options (`header`, `separator`, `occurrence`,
+`aggregator`, `quote`), and the packet list's columns can be asked for by
+their tshark names, such as `-e _ws.col.info` and `-e _ws.col.protocol`.
+
+### Hex dumps
+
+`-x` prints each packet's bytes as tshark does, line for line:
+
+```console
+$ uv run pilotfish -r samples/wireshark-wiki/dns.cap -c 1 -x
+0000  00 c0 9f 32 41 8c 00 e0 18 b1 0c ad 08 00 45 00   ...2A.........E.
+0010  00 38 00 00 40 00 40 11 65 47 c0 a8 aa 08 c0 a8   .8..@.@.eG......
+0020  aa 14 80 1b 00 35 00 24 85 ed 10 32 01 00 00 01   .....5.$...2....
+0030  00 00 00 00 00 00 06 67 6f 6f 67 6c 65 03 63 6f   .......google.co
+0040  6d 00 00 10 00 01                                 m.....
+```
+
+A message put together from several packets is in none of them, so its
+bytes follow the packet's own under a heading of their own. With `-V`, the
+tree comes first.
+
+### Saving
+
+`-w` writes the packets kept to a pcapng file, or a pcap file with `-F pcap`,
+with timestamps to the nanosecond. On its own it prints nothing; `-P` prints
+as well. `-w -` writes to standard output and `-r -` reads standard input,
+so captures go through pipes:
+
+```console
+$ uv run pilotfish -r samples/wireshark-wiki/http.cap -w - | uv run pilotfish -r - -Y http.request -T fields -e http.host
+www.ethereal.com
+pagead2.googlesyndication.com
+```
+
+`-r -` reads to the end of its input before decoding, so it is for files
+passed along a pipe rather than for watching a live one.
+
+### Exit status
+
+Every failure is one line on standard error starting `pilotfish:`, and the
+exit status says which kind it was. The numbers are the ones Wireshark's
+tools use, so a script written around tshark reads them the same way:
+
+| Status | Meaning |
+|---|---|
+| 0 | success |
+| 1 | the command line doesn't make sense: an unknown flag, a bad value, flags that can't go together |
+| 2 | there is no interface by that name |
+| 3 | the file to read is missing or isn't a capture file |
+| 4 | a display or capture filter doesn't compile |
+| 5 | capturing needs access to `/dev/bpf*` |
+| 9 | the file to write can't be created |
+| 14 | the file being read is cut short or damaged partway; what came before it is printed |
+| 15 | writing the capture file failed |
+| 17 | live capture failed |
+| 130 | interrupted |
+| 141 | whatever was reading the output went away, as `\| head` does |
+
+Output that was started is always finished: JSON gets its closing bracket
+even when the file turns out to be damaged or a capture is stopped with
+Ctrl+C.
+
 ## Capturing live traffic
 
 ```console
-$ sudo .venv/bin/pilotfish capture -i lo0 -c 4
+$ sudo .venv/bin/pilotfish -i lo0 -c 4
 Capturing on lo0 (Loopback)
     No.  Time                  Source                 Destination            Protocol  Length  Info
       1  1790784020.718730000  127.0.0.1              127.0.0.1              ICMP          88  Echo (ping) request  id=0x9294, seq=0
@@ -95,11 +210,13 @@ Capturing on lo0 (Loopback)
   it with sudo for now. Use the venv's script directly, as above — `sudo uv run`
   would run uv itself as root.
 - Ctrl+C stops cleanly and reports what was dropped, in tcpdump's wording.
-- `uv run pilotfish interfaces` lists what you can capture on, with the names
-  System Settings uses (en0 is usually Wi-Fi, lo0 is loopback, utun are VPN
-  tunnels).
+- `uv run pilotfish -D` lists what you can capture on, and
+  `uv run pilotfish interfaces` adds each one's status and addresses (en0 is
+  usually Wi-Fi, lo0 is loopback, utun are VPN tunnels).
 - `-c N` stops after N packets. `--backend bpf` skips libpcap and reads
-  `/dev/bpf` directly. `pilotfish capture --help` has the rest.
+  `/dev/bpf` directly. Every printing and saving flag works live too, so
+  `-T json`, `-T fields` and `-w` can watch an interface as well as read a
+  file.
 
 On Wi-Fi you mostly see your own Mac's traffic plus broadcast and multicast.
 That's normal: the card only passes up frames addressed to this Mac.
@@ -111,7 +228,7 @@ use — which is compiled and handed to the kernel, so packets you filtered out
 cost nothing:
 
 ```console
-$ sudo .venv/bin/pilotfish capture -i en8 -f 'udp port 53' -c 4
+$ sudo .venv/bin/pilotfish -i en8 -f 'udp port 53' -c 4
 ...
 4 packets captured
 1008 packets received by filter
@@ -120,7 +237,7 @@ $ sudo .venv/bin/pilotfish capture -i en8 -f 'udp port 53' -c 4
 A filter that doesn't compile is reported with libpcap's own message:
 
 ```console
-$ uv run pilotfish capture -f 'udp porrt 53'
+$ uv run pilotfish -f 'udp porrt 53'
 pilotfish: capture filter "udp porrt 53": can't parse filter expression: syntax error
 ```
 
@@ -128,7 +245,7 @@ pilotfish: capture filter "udp porrt 53": can't parse filter expression: syntax 
 of the instruction array:
 
 ```console
-$ sudo .venv/bin/pilotfish capture -i en0 -f 'udp port 53' -d
+$ sudo .venv/bin/pilotfish -i en0 -f 'udp port 53' -d
 (000) ldh      [12]
 (001) jeq      #0x86dd          jt 2	jf 8
 (002) ldb      [20]
@@ -146,7 +263,7 @@ for 53 — and either keep the packet up to the snapshot length (018) or drop
 it (019). Jump targets are absolute, so it reads straight down.
 
 The same program runs over saved files too, interpreted in Python, so
-`pilotfish read -f ...` filters a capture file the same way.
+`pilotfish -r FILE -f ...` filters a capture file the same way.
 
 ## Display filters
 
@@ -155,7 +272,7 @@ filter runs after decoding, so it can ask about anything a dissector worked
 out, by field name, in the syntax Wireshark uses:
 
 ```console
-$ uv run pilotfish read samples/wireshark-wiki/dns.cap -Y 'dns.flags.response == 1 and dns.qry.name contains "www"'
+$ uv run pilotfish -r samples/wireshark-wiki/dns.cap -Y 'dns.flags.response == 1 and dns.qry.name contains "www"'
     No.  Time                  Source                 Destination            Protocol  Length  Info
      10  1112172558.734862000  192.168.170.20         192.168.170.8          DNS           90  Standard query response 0x75c0 A www.netbsd.org A 204.152.190.12
      12  1112172575.698849000  192.168.170.20         192.168.170.8          DNS          102  Standard query response 0xf0d4 AAAA www.netbsd.org AAAA 2001:4f8:4:7:2e0:81ff:fe52:9a6b
@@ -190,15 +307,15 @@ those should mean. `===` and `!==` ask the other way round.
 A filter that is wrong says what is wrong and points at it:
 
 ```console
-$ uv run pilotfish read samples/wireshark-wiki/http.cap -Y 'ip.src == 145.254.160.300'
+$ uv run pilotfish -r samples/wireshark-wiki/http.cap -Y 'ip.src == 145.254.160.300'
 pilotfish: display filter: ip.src is an IPv4 address, and 300 is too large for a part of one: each is 0 to 255
     ip.src == 145.254.160.300
                           ^~~
-$ uv run pilotfish read samples/wireshark-wiki/http.cap -Y 'tcp.prot == 80'
+$ uv run pilotfish -r samples/wireshark-wiki/http.cap -Y 'tcp.prot == 80'
 pilotfish: display filter: no field is named "tcp.prot"; did you mean "tcp.port"?
     tcp.prot == 80
     ^~~~~~~~
-$ uv run pilotfish read samples/wireshark-wiki/http.cap -Y 'http.host matches "ethereal(\\.com"'
+$ uv run pilotfish -r samples/wireshark-wiki/http.cap -Y 'http.host matches "ethereal(\\.com"'
 pilotfish: display filter: this regular expression doesn't compile: missing ), unterminated subpattern
     http.host matches "ethereal(\\.com"
                                ^
@@ -278,7 +395,7 @@ Content-Length: 20000
 ...
 ```
 
-The number is the stream index `read -V` shows for each TCP packet. `--raw
+The number is the stream index `-V` shows for each TCP packet. `--raw
 client` or `--raw server` writes one end's bytes exactly as they were sent,
 which is how to check that a download comes back whole. In that capture the
 fourth segment of the file overtakes the third and the last is sent twice,
@@ -330,7 +447,7 @@ Some of what that gives you:
   is given back as the file it carried.
 
 ```console
-$ uv run pilotfish read samples/made/tcp.pcap
+$ uv run pilotfish -r samples/made/tcp.pcap
       5  1700000000.040000000  192.0.2.1  192.0.2.2  TCP  154  [TCP Previous segment not captured] 50000 → 80 [PSH, ACK] Seq=301 Ack=1 Win=8000 Len=100
       6  1700000000.041000000  192.0.2.1  192.0.2.2  TCP  154  [TCP Retransmission] 50000 → 80 [PSH, ACK] Seq=101 Ack=1 Win=8000 Len=100
      11  1700000000.160000000  192.0.2.2  192.0.2.1  TCP   54  [TCP Dup ACK 8#2] 80 → 50000 [ACK] Seq=1 Ack=401 Win=8000 Len=0
@@ -342,7 +459,7 @@ A packet that only carries part of a message says so, and the message
 appears where its last byte does:
 
 ```console
-$ uv run pilotfish read samples/wireshark-wiki/http.cap
+$ uv run pilotfish -r samples/wireshark-wiki/http.cap
      34  ...  TCP   1434  80 → 3372 [ACK] Seq=16561 Ack=480 Win=6432 Len=1380 [TCP segment of a reassembled PDU]
      38  ...  HTTP   478  HTTP/1.1 200 OK  (text/html)
 ```
@@ -380,6 +497,12 @@ flowchart LR
   needs and is handed the same bytes again once they have arrived. Fields
   decoded from a reassembled message point into the reassembled bytes, the
   way Wireshark opens a second tab beside the frame.
+- **One pipeline.** A file and a live capture differ only in where packets
+  come from. After that every packet takes the same path: decoded, asked
+  about by the display filter, then handed to whichever printer the flags
+  chose (the packet list, a tree, a hex dump, JSON, fields) and to the file
+  being written. A packet is only decoded if something needs its tree, so
+  saving a capture straight to disk costs no decoding.
 - **Staying small.** Whoever sends the packets chooses what they claim, so
   everything kept for later has a limit: fragments that never complete are
   dropped after thirty seconds or once four megabytes are waiting, a stream
@@ -391,7 +514,9 @@ flowchart LR
   lands in. Random bytes are fuzzed through every dissector, and segments and
   fragments through reassembly in any order, to prove a bad packet can only
   ever be marked malformed. Display filters are generated at random too, and
-  the compiled function has to agree with the tree walk on every one.
+  the compiled function has to agree with the tree walk on every one. The
+  JSON the command line prints is read back and held to tshark's the same
+  way, and its fields and hex dumps to tshark's own output.
 
 | Path | Contents |
 |---|---|
@@ -402,7 +527,8 @@ flowchart LR
 | `src/pilotfish/core/protocols/` | one module per protocol |
 | `src/pilotfish/core/reassembly/` | fragments and TCP streams, put back in order |
 | `src/pilotfish/core/follow.py` | following a TCP stream |
-| `src/pilotfish/cli/` | command line tool |
+| `src/pilotfish/core/formats/` | pcap and pcapng: reading and writing |
+| `src/pilotfish/cli/` | command line tool: flags, the packet pipeline, text, JSON, fields and hex output |
 | `src/pilotfish/gui/` | PySide6 desktop app |
 | `tests/`, `samples/`, `scripts/` | tests, capture files with answer keys, dev tools |
 
@@ -443,7 +569,7 @@ tests don't: their output for each sample is saved in the repo. See
 **Stage 3: Filters, command line and files**
 
 - [x] Phase 10: display filters
-- [ ] Phase 11: the command line tool
+- [x] Phase 11: the command line tool
 - [ ] Phase 12: saving and exporting files
 
 ## Capture responsibly

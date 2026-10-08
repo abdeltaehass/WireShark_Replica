@@ -20,6 +20,7 @@ from hypothesis import strategies as st
 from packets import ethernet, ipv4, ipv6, tcp
 from pilotfish.cli import follow as follow_command
 from pilotfish.cli.main import main
+from pilotfish.cli.status import Exit
 from pilotfish.core.dissect import ProtocolTree, Session, dissect
 from pilotfish.core.follow import Chunk, follow_tcp_stream
 from pilotfish.core.formats import CaptureFile
@@ -341,7 +342,7 @@ class TestTheCommand:
     def test_a_file_that_is_not_there(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        assert main(["follow", str(tmp_path / "missing.pcap"), "0"]) == 1
+        assert main(["follow", str(tmp_path / "missing.pcap"), "0"]) == Exit.INVALID_FILE
         assert "No such file or directory" in capsys.readouterr().err
 
     def test_a_stream_number_below_zero_is_refused(

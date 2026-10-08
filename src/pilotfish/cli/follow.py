@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 from typing import BinaryIO, Literal, TextIO
 
+from pilotfish.cli.status import CommandError, Exit
 from pilotfish.core.follow import Chunk, FollowedStream, follow_tcp_stream
 from pilotfish.core.formats import CaptureFile, CaptureFileError
 from pilotfish.core.protocols.conversations import Endpoint
@@ -22,7 +23,7 @@ def run(
     raw: Side | None = None,
     out: TextIO | None = None,
     binary: BinaryIO | None = None,
-) -> int:
+) -> Exit:
     """Print a stream's conversation, each end's turns marked.
 
     With ``raw``, write one end's bytes exactly as they were sent and nothing
@@ -33,18 +34,16 @@ def run(
             stream = follow_tcp_stream(capture, index)
     except (OSError, CaptureFileError) as error:
         reason = error.strerror if isinstance(error, OSError) and error.strerror else str(error)
-        print(f"pilotfish: {path}: {reason}", file=sys.stderr)
-        return 1
+        raise CommandError(Exit.INVALID_FILE, f"{path}: {reason}") from None
     except LookupError as error:
-        print(f"pilotfish: {path}: {error}", file=sys.stderr)
-        return 1
+        raise CommandError(Exit.INVALID_OPTION, f"{path}: {error}") from None
     if raw is not None:
         binary = binary or sys.stdout.buffer
         binary.write(stream.from_client if raw == "client" else stream.from_server)
         binary.flush()
-        return 0
+        return Exit.OK
     write_conversation(stream, out or sys.stdout)
-    return 0
+    return Exit.OK
 
 
 def write_conversation(stream: FollowedStream, out: TextIO) -> None:

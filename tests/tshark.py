@@ -192,17 +192,22 @@ def compare(tree: ProtocolTree, expected: Fields, skip: Container[str] = ()) -> 
     protocols pilotfish doesn't decode, or are values Wireshark works out
     rather than reads. Anything pilotfish claims, though, has to agree.
     """
-    names = {
-        node.name
-        for node in tree.walk()
-        if node.value is not None and node.name in expected and node.name not in skip
-    }
+    decoded: dict[str, list[Value]] = {}
+    for node in tree.walk():
+        if node.value is not None and node.name in expected and node.name not in skip:
+            decoded.setdefault(node.name, []).append(node.value)
+    compare_values(decoded, expected)
+
+
+def compare_values(decoded: dict[str, list[Value]], expected: Fields) -> None:
+    """Check pilotfish's values for a packet, by field name, against tshark's.
+
+    ``decoded`` holds only names tshark reported too, as :func:`compare`
+    collects them, or as the JSON pilotfish prints is read back.
+    """
     ours: dict[str, object] = {}
     theirs: dict[str, object] = {}
-    for name in names:
-        values = [
-            node.value for node in tree.walk() if node.name == name and node.value is not None
-        ]
+    for name, values in decoded.items():
         texts = expected[name]
         if REGISTRY.fields[name].type is FieldType.BOOL and all(text == "" for text in texts):
             # Wireshark writes a flag as an item with nothing in it, and can
