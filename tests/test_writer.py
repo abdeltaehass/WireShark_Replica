@@ -12,10 +12,13 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from pilotfish.core.formats import (
     CaptureFile,
     FileFormat,
+    Interface,
     PcapngWriter,
     PcapWriter,
     WriteError,
@@ -85,19 +88,58 @@ def sample_id(capture: Path) -> str:
 
 
 @pytest.mark.parametrize("capture", REPOSITORY_SAMPLES, ids=sample_id)
-@pytest.mark.parametrize("file_format", list(FileFormat))
-def test_every_sample_reads_back_as_it_was(capture: Path, file_format: FileFormat) -> None:
+def test_every_sample_reads_back_as_it_was_written_as_pcapng(capture: Path) -> None:
+    """Read, write, read: the same bytes, times, comments and interfaces.
+
+    A packet that had no time still has none, because it goes back into a
+    Simple Packet Block, and each interface keeps its resolution, so a time
+    counted in microseconds is written in microseconds again.
+    """
     with CaptureFile(capture) as original:
         packets = list(original)
-    if file_format is FileFormat.PCAP and len({each.link_type for each in packets}) > 1:
-        # pcap has one link type for the whole file, so these can't be written as one.
-        with pytest.raises(WriteError):
-            written(packets, file_format)
+    again = read_back(written(packets, FileFormat.PCAPNG))
+    assert records(again) == records(packets)
+    assert [each.comments for each in again] == [each.comments for each in packets]
+    assert [described(each.interface) for each in again] == [
+        described(each.interface) for each in packets
+    ]
+
+
+@pytest.mark.parametrize("capture", REPOSITORY_SAMPLES, ids=sample_id)
+def test_every_sample_reads_back_as_it_was_written_as_pcap(capture: Path) -> None:
+    """pcap can't hold everything pcapng can, and says so rather than losing it."""
+    with CaptureFile(capture) as original:
+        packets = list(original)
+    if len({each.link_type for each in packets}) > 1:
+        # One link type for the whole file.
+        with pytest.raises(WriteError, match="one link type"):
+            written(packets, FileFormat.PCAP)
         return
-    again = read_back(written(packets, file_format))
-    # A packet with no time is given 0, since both formats give every packet one.
+    first = packets[0].interface if packets else None
+    microseconds = first is not None and first.units_per_second == 1_000_000
+    if microseconds and any((each.timestamp_ns or 0) % 1_000 for each in packets):
+        # A header in microseconds, set by the first packet, and a later
+        # packet from an interface that counted finer.
+        with pytest.raises(WriteError, match="nanoseconds"):
+            written(packets, FileFormat.PCAP)
+        return
+    again = read_back(written(packets, FileFormat.PCAP))
+    # A packet with no time is given 0, since every pcap record has one.
     expected = [(time or 0, *rest) for time, *rest in records(packets)]
     assert records(again) == expected
+
+
+def described(interface: Interface | None) -> tuple[object, ...]:
+    """What a file says about an interface, leaving out which file it was."""
+    assert interface is not None
+    return (
+        interface.link_type,
+        interface.snaplen,
+        interface.units_per_second,
+        interface.offset_seconds,
+        interface.name,
+        interface.description,
+    )
 
 
 def test_timestamps_keep_every_nanosecond() -> None:
@@ -194,19 +236,207 @@ class TestPcapng:
             assert bytes(read_back(stream.getvalue())[0].data) == bytes(range(size))
 
 
-@pytest.mark.skipif(shutil.which("tshark") is None, reason="needs tshark")
-@pytest.mark.parametrize("file_format", list(FileFormat))
-def test_tshark_reads_what_was_written(tmp_path: Path, file_format: FileFormat) -> None:
-    with CaptureFile(SAMPLES_DIR / "wireshark-wiki" / "http.cap") as capture:
-        packets = list(capture)
-    path = tmp_path / f"http.{file_format}"
-    path.write_bytes(written(packets, file_format))
-    result = subprocess.run(
-        ["tshark", "-n", "-r", str(path), "-T", "fields", "-e", "frame.time_epoch"],
-        capture_output=True,
-        text=True,
-        check=True,
+LITTLE_ENDIAN_PCAPS = [
+    capture
+    for capture in REPOSITORY_SAMPLES
+    if capture.suffix in {".pcap", ".cap"}
+    and capture.read_bytes()[:4] in {b"\xd4\xc3\xb2\xa1", b"M<\xb2\xa1"}
+]
+
+
+@pytest.mark.parametrize("capture", LITTLE_ENDIAN_PCAPS, ids=sample_id)
+def test_a_pcap_file_written_again_is_the_same_file(capture: Path) -> None:
+    """Not only the packets: the header too, resolution and snapshot length and all.
+
+    The writer only writes little-endian files, so a big-endian one, such as
+    nlmon-big.pcap, comes back with its bytes swapped round.
+    """
+    with CaptureFile(capture) as original:
+        packets = list(original)
+    assert written(packets, FileFormat.PCAP) == capture.read_bytes()
+
+
+@pytest.mark.parametrize("capture", REPOSITORY_SAMPLES, ids=sample_id)
+def test_writing_what_was_written_changes_nothing(capture: Path) -> None:
+    once = written(read_back_file(capture), FileFormat.PCAPNG)
+    assert written(read_back(once), FileFormat.PCAPNG) == once
+
+
+def read_back_file(capture: Path) -> list[Packet]:
+    with CaptureFile(capture) as file:
+        return list(file)
+
+
+class TestResolution:
+    """Each interface's times are written in its own units."""
+
+    @pytest.mark.parametrize(
+        ("units", "tsresol"),
+        [
+            (1_000_000, None),
+            (1_000_000_000, 9),
+            (1_000, 3),
+            (1, 0),
+            (2**10, 0x8A),
+            (2**20, 0x94),
+        ],
     )
-    assert result.stderr == ""
-    assert result.stdout.splitlines()[0] == "1084443427.311224000"
-    assert len(result.stdout.splitlines()) == len(packets)
+    def test_pcapng(self, units: int, tsresol: int | None) -> None:
+        interface = Interface(1, 0, units, name="eth0")
+        times = [interface.timestamp_ns(ticks) for ticks in (0, 1, 1_000_001, 2**40 + 3)]
+        packets = [Packet(time, 3, 1, b"abc", interface=interface) for time in times]
+        data = written(packets, FileFormat.PCAPNG)
+        again = read_back(data)
+        assert [each.timestamp_ns for each in again] == times
+        assert {each.interface for each in again} == {interface}
+        option = struct.pack("<HH", 9, 1)
+        assert (option in data) is (tsresol is not None)
+        if tsresol is not None:
+            assert option + bytes([tsresol]) in data
+
+    def test_an_offset_is_kept(self) -> None:
+        interface = Interface(1, 0, 1_000_000, offset_seconds=1_000_000_000)
+        time = interface.timestamp_ns(5)
+        (again,) = read_back(
+            written([Packet(time, 1, 1, b"x", interface=interface)], FileFormat.PCAPNG)
+        )
+        assert again.timestamp_ns == time
+        assert again.interface == interface
+
+    @pytest.mark.parametrize(
+        ("units", "magic"), [(1_000_000, b"\xd4\xc3\xb2\xa1"), (1_000_000_000, b"M<\xb2\xa1")]
+    )
+    def test_pcap_keeps_microseconds_or_nanoseconds(self, units: int, magic: bytes) -> None:
+        interface = Interface(1, 1514, units)
+        data = written([Packet(1_000_000_000, 3, 1, b"abc", interface=interface)], FileFormat.PCAP)
+        assert data[:4] == magic
+        assert struct.unpack_from("<I", data, 16) == (1514,)
+
+    def test_a_time_finer_than_its_interface_is_not_rounded(self) -> None:
+        microseconds = Interface(1, 0, 1_000_000, name="en0")
+        packets = [
+            Packet(1_000, 1, 1, b"x", interface=microseconds),
+            Packet(1_001, 1, 1, b"x", interface=microseconds),
+        ]
+        again = read_back(written(packets, FileFormat.PCAPNG))
+        assert [each.timestamp_ns for each in again] == [1_000, 1_001]
+        # The second went on a copy of the interface that counts nanoseconds.
+        assert [each.interface.units_per_second for each in again if each.interface] == [
+            1_000_000,
+            1_000_000_000,
+        ]
+
+    def test_pcap_refuses_to_round_a_time(self) -> None:
+        microseconds = Interface(1, 0, 1_000_000)
+        nanoseconds = Interface(1, 0, 1_000_000_000)
+        packets = [
+            Packet(1_000_000_000, 1, 1, b"x", interface=microseconds),
+            Packet(1_000_000_001, 1, 1, b"x", interface=nanoseconds),
+        ]
+        with pytest.raises(WriteError, match="nanoseconds"):
+            written(packets, FileFormat.PCAP)
+        # Unless the header is told to count nanoseconds from the start.
+        again = read_back(written(packets, FileFormat.PCAP, nanoseconds=True))
+        assert [each.timestamp_ns for each in again] == [1_000_000_000, 1_000_000_001]
+
+    @given(
+        st.sampled_from(
+            [10**exponent for exponent in range(10)] + [2**exponent for exponent in range(30)]
+        ),
+        st.integers(-(2**62), 2**62),
+        st.integers(-(10**9), 10**9),
+    )
+    def test_ticks_undo_timestamp_ns(self, units: int, ticks: int, offset: int) -> None:
+        """Exact for every resolution up to a nanosecond."""
+        interface = Interface(1, 0, units, offset_seconds=offset)
+        assert interface.ticks(interface.timestamp_ns(ticks)) == ticks
+
+
+class TestComments:
+    def test_comments_are_kept(self) -> None:
+        packets = [
+            Packet(1, 3, 1, b"abc", comments=("first", "second")),
+            Packet(2, 3, 1, b"abc"),
+            Packet(3, 3, 1, b"abc", comments=("ünïcode ✓",)),
+        ]
+        again = read_back(written(packets, FileFormat.PCAPNG))
+        assert [each.comments for each in again] == [("first", "second"), (), ("ünïcode ✓",)]
+
+    def test_the_sample_comments_are_kept(self) -> None:
+        with CaptureFile(SAMPLES_DIR / "wireshark-wiki" / "pcapng-example.pcapng") as file:
+            packets = list(file)
+        commented = {
+            number: each.comments
+            for number, each in enumerate(read_back(written(packets, FileFormat.PCAPNG)), 1)
+            if each.comments
+        }
+        assert commented == {
+            42: ("Hello, world!",),
+            289: ("The Answer to the Ultimate Question of Life, the Universe, and Everything",),
+            290: ("The Answer to the Ultimate Question of Life, the Universe, and Everything",),
+            314: ("Hello, world!",),
+        }
+
+    def test_a_description_is_kept(self) -> None:
+        interface = Interface(1, 0, name="en0", description="Wi-Fi")
+        (again,) = read_back(
+            written([Packet(1_000, 1, 1, b"x", interface=interface)], FileFormat.PCAPNG)
+        )
+        assert again.interface == interface
+
+
+class TestPacketsWithoutTimes:
+    def test_they_go_back_into_simple_packet_blocks(self) -> None:
+        interface = Interface(1, 0)
+        data = written([Packet(None, 3, 1, b"abc", interface=interface)], FileFormat.PCAPNG)
+        assert block_types(data) == [0x0A0D0D0A, 1, 3]
+        (again,) = read_back(data)
+        assert again.timestamp_ns is None
+
+    def test_a_new_section_starts_when_the_interface_isnt_first(self) -> None:
+        first, second = Interface(1, 0, name="a"), Interface(1, 0, name="b")
+        packets = [
+            Packet(1_000, 3, 1, b"abc", interface=first),
+            Packet(None, 3, 1, b"abc", interface=second),
+        ]
+        data = written(packets, FileFormat.PCAPNG)
+        assert block_types(data) == [0x0A0D0D0A, 1, 6, 0x0A0D0D0A, 1, 3]
+        again = read_back(data)
+        assert [each.timestamp_ns for each in again] == [1_000, None]
+        assert [each.interface for each in again] == [first, second]
+
+    def test_one_cut_short_or_with_a_comment_needs_a_time(self) -> None:
+        interface = Interface(1, 0)
+        cut = Packet(None, 100, 1, b"abc", interface=interface)
+        noted = Packet(None, 3, 1, b"abc", interface=interface, comments=("note",))
+        data = written([cut, noted], FileFormat.PCAPNG)
+        assert block_types(data) == [0x0A0D0D0A, 1, 6, 6]
+        assert [each.timestamp_ns for each in read_back(data)] == [0, 0]
+
+
+@pytest.mark.skipif(shutil.which("tshark") is None, reason="needs tshark")
+@pytest.mark.parametrize("capture", REPOSITORY_SAMPLES, ids=sample_id)
+def test_tshark_reads_a_written_file_as_it_reads_the_original(
+    capture: Path, tmp_path: Path
+) -> None:
+    """Wireshark's own reader agrees: the same times, lengths, comments and interfaces.
+
+    tshark lists a pcapng custom block as a row of its own, and those aren't
+    packets, so they are left out of the original's rows.
+    """
+    path = tmp_path / "written.pcapng"
+    path.write_bytes(written(read_back_file(capture), FileFormat.PCAPNG))
+    fields = ["frame.time_epoch", "frame.len", "frame.cap_len", "frame.comment", "frame.encap_type"]
+
+    def rows(capture_file: Path, *extra: str) -> list[str]:
+        result = subprocess.run(
+            ["tshark", "-n", "-r", str(capture_file), *extra, "-T", "fields"]
+            + [argument for name in fields for argument in ("-e", name)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert result.stderr == ""
+        return result.stdout.splitlines()
+
+    assert rows(path) == rows(capture, "-Y", "not frame.cb_pen")

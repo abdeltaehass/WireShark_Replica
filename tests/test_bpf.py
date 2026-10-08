@@ -15,7 +15,7 @@ from pilotfish.core.capture import (
     PcapSource,
     bpf,
 )
-from pilotfish.core.packet import Packet
+from pilotfish.core.packet import Interface, Packet
 
 
 # Values printed by a C program built against <net/bpf.h> in the macOS SDK.
@@ -193,3 +193,11 @@ class TestLiveCapture:
         source.close()
         with pytest.raises(CaptureError, match="capture is closed"):
             source.read()
+
+
+def test_packets_say_which_interface_they_came_from() -> None:
+    interface = Interface(1, 96, 1_000_000, name="en0")
+    data = b"\x01" * 60
+    packet = Packet(1_000_000_000, 60, 1, data)
+    (parsed,) = bpf.parse_records(bpf_record(packet), 1, interface)
+    assert parsed.interface is interface

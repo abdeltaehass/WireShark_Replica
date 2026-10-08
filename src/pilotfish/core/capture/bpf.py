@@ -24,7 +24,7 @@ from pilotfish.core.capture.libpcap import compile_filter, interface_netmask
 from pilotfish.core.capture.source import CaptureOptions, KernelStats
 from pilotfish.core.filters.program import Program
 from pilotfish.core.linktypes import link_type_from_dlt
-from pilotfish.core.packet import Packet
+from pilotfish.core.packet import MICROSECONDS, Interface, Packet
 from pilotfish.core.timestamps import NS_PER_SECOND
 
 # An ioctl request packs the direction data is copied in, the size of the
@@ -79,7 +79,9 @@ def _word_align(length: int) -> int:
     return (length + 3) & ~3
 
 
-def parse_records(buffer: Buffer, link_type: int) -> Iterator[Packet]:
+def parse_records(
+    buffer: Buffer, link_type: int, interface: Interface | None = None
+) -> Iterator[Packet]:
     """Split the data from one read of a BPF device into packets.
 
     Each record is a ``bpf_hdr`` padded out to ``bh_hdrlen`` bytes, the
@@ -117,6 +119,7 @@ def parse_records(buffer: Buffer, link_type: int) -> Iterator[Packet]:
             link_type=link_type,
             # The next read overwrites the buffer, so copy the bytes out now.
             data=bytes(view[start:stop]),
+            interface=interface,
         )
         offset += _word_align(header_length + captured_length)
 
@@ -176,6 +179,10 @@ class BpfSource:
             raise CaptureError(f"{self.interface}: BIOCSETIF: {error.strerror}") from error
         (dlt,) = _U32.unpack(self._ioctl(fd, "BIOCGDLT", BIOCGDLT, bytes(4)))
         self.link_type = link_type_from_dlt(dlt)
+        # The kernel's records count time in microseconds.
+        self.description = Interface(
+            self.link_type, options.snaplen, MICROSECONDS, name=self.interface
+        )
 
         if options.immediate:
             self._ioctl(fd, "BIOCIMMEDIATE", BIOCIMMEDIATE, _U32.pack(1))
@@ -231,7 +238,9 @@ class BpfSource:
             raise CaptureError(f"{self.interface}: {error.strerror}") from error
         if not length:
             return None
-        self._records = parse_records(memoryview(self._buffer)[:length], self.link_type)
+        self._records = parse_records(
+            memoryview(self._buffer)[:length], self.link_type, self.description
+        )
         return next(self._records, None)
 
     def stats(self) -> KernelStats:

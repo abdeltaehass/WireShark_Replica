@@ -17,12 +17,10 @@ Reference: https://datatracker.ietf.org/doc/draft-ietf-opsawg-pcapng/
 
 import struct
 from collections.abc import Iterator
-from dataclasses import dataclass
 
 from pilotfish.core.formats.errors import CaptureFileError
 from pilotfish.core.formats.pcap import ByteOrder
-from pilotfish.core.packet import Packet
-from pilotfish.core.timestamps import NS_PER_SECOND
+from pilotfish.core.packet import Interface, Packet
 
 SECTION_HEADER_MAGIC = b"\x0a\x0d\x0d\x0a"
 
@@ -35,7 +33,9 @@ BLOCK_ENHANCED_PACKET = 0x00000006
 BYTE_ORDER_MAGIC = 0x1A2B3C4D
 
 OPTION_END = 0
+OPTION_COMMENT = 1
 OPTION_IF_NAME = 2
+OPTION_IF_DESCRIPTION = 3
 OPTION_IF_TSRESOL = 9
 OPTION_IF_TSOFFSET = 14
 
@@ -62,22 +62,6 @@ _ENHANCED_PACKET = _structs("IIIII")
 _PACKET = _structs("HHIIII")
 _OPTION = _structs("HH")
 _I64 = _structs("q")
-
-
-@dataclass(frozen=True, slots=True)
-class Interface:
-    """An interface described by an Interface Description Block."""
-
-    link_type: int
-    snaplen: int
-    units_per_second: int = 1_000_000
-    """Timestamp resolution from ``if_tsresol``; microseconds when the option is absent."""
-    offset_seconds: int = 0
-    """Seconds added to every timestamp, from ``if_tsoffset``."""
-    name: str | None = None
-
-    def timestamp_ns(self, ticks: int) -> int:
-        return ticks * NS_PER_SECOND // self.units_per_second + self.offset_seconds * NS_PER_SECOND
 
 
 class PcapngReader:
@@ -117,6 +101,10 @@ class PcapngReader:
                     link_type=interface.link_type,
                     data=_packet_data(data, body_start + 20, body_end, captured_length, offset),
                     interface_id=interface_id,
+                    interface=interface,
+                    comments=_comments(
+                        data, body_start + 20, body_end, captured_length, byte_order
+                    ),
                 )
             elif block_type == BLOCK_SIMPLE_PACKET:
                 # No interface ID or timestamp: the packet belongs to interface 0,
@@ -131,6 +119,7 @@ class PcapngReader:
                     original_length=original_length,
                     link_type=interface.link_type,
                     data=_packet_data(data, body_start + 4, body_end, captured_length, offset),
+                    interface=interface,
                 )
             elif block_type == BLOCK_PACKET:
                 interface_id, _drops, high, low, captured_length, original_length = _PACKET[
@@ -143,6 +132,10 @@ class PcapngReader:
                     link_type=interface.link_type,
                     data=_packet_data(data, body_start + 20, body_end, captured_length, offset),
                     interface_id=interface_id,
+                    interface=interface,
+                    comments=_comments(
+                        data, body_start + 20, body_end, captured_length, byte_order
+                    ),
                 )
             elif block_type == BLOCK_INTERFACE_DESCRIPTION:
                 interfaces.append(_parse_interface(data, body_start, body_end, byte_order))
@@ -220,7 +213,7 @@ def _parse_interface(
     link_type, _, snaplen = _INTERFACE[byte_order].unpack_from(data, body_start)
     units_per_second = 1_000_000
     offset_seconds = 0
-    name = None
+    name = description = None
     for code, value in _options(data, body_start + 8, body_end, byte_order):
         if code == OPTION_IF_TSRESOL and len(value) >= 1:
             # High bit clear: resolution is 10**-n seconds. Set: 2**-n seconds.
@@ -229,8 +222,29 @@ def _parse_interface(
         elif code == OPTION_IF_TSOFFSET and len(value) >= 8:
             (offset_seconds,) = _I64[byte_order].unpack_from(value)
         elif code == OPTION_IF_NAME:
-            name = bytes(value).decode("utf-8", errors="replace").rstrip("\0")
-    return Interface(link_type, snaplen, units_per_second, offset_seconds, name)
+            name = _text(value)
+        elif code == OPTION_IF_DESCRIPTION:
+            description = _text(value)
+    return Interface(link_type, snaplen, units_per_second, offset_seconds, name, description)
+
+
+def _comments(
+    data: memoryview, start: int, body_end: int, captured_length: int, byte_order: ByteOrder
+) -> tuple[str, ...]:
+    """The comments among a packet block's options, which follow its padded data."""
+    options = start + ((captured_length + 3) & ~3)
+    if options >= body_end:
+        return ()
+    return tuple(
+        _text(value)
+        for code, value in _options(data, options, body_end, byte_order)
+        if code == OPTION_COMMENT
+    )
+
+
+def _text(value: memoryview) -> str:
+    """An option's UTF-8 text. Some writers count a trailing zero byte in."""
+    return bytes(value).decode("utf-8", errors="replace").rstrip("\0")
 
 
 def _options(

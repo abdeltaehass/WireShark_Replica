@@ -143,11 +143,11 @@ class Pipeline:
         self._out.flush()
 
     def _writing(self) -> AbstractContextManager[None]:
-        return _write_errors(self._writing_to)
+        return write_errors(self._writing_to)
 
 
 @contextmanager
-def _write_errors(name: str) -> Iterator[None]:
+def write_errors(name: str) -> Iterator[None]:
     """Turn a failure to write the capture file into the exit status for one.
 
     A reader at the other end of a pipe going away is something else, and

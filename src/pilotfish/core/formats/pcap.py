@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from pilotfish.core.formats.errors import CaptureFileError
-from pilotfish.core.packet import Packet
+from pilotfish.core.packet import Interface, Packet
 
 type ByteOrder = Literal["<", ">"]
 
@@ -106,6 +106,11 @@ class PcapReader:
         record = _RECORDS[self.header.byte_order]
         ns_per_tick = 1 if self.header.nanosecond else 1_000
         link_type = self.header.link_type
+        interface = Interface(
+            link_type,
+            self.header.snaplen,
+            1_000_000_000 if self.header.nanosecond else 1_000_000,
+        )
         offset = HEADER_SIZE
         while offset < end:
             if end - offset < RECORD_SIZE:
@@ -126,6 +131,7 @@ class PcapReader:
                 original_length=original_length,
                 link_type=link_type,
                 data=data[start:stop],
+                interface=interface,
             )
             offset = stop
 

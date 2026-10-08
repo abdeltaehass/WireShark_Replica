@@ -35,6 +35,9 @@ class Frame(Dissector):
         Field("frame.len", FieldType.UINT, "Frame length"),
         Field("frame.cap_len", FieldType.UINT, "Capture length"),
         Field("frame.time_epoch", FieldType.TIME, "Epoch arrival time"),
+        Field("frame.interface_name", FieldType.STRING, "Interface name"),
+        Field("frame.interface_description", FieldType.STRING, "Interface description"),
+        Field("frame.comment", FieldType.STRING, "Comment"),
     )
 
     def dissect(self, reader: Reader, context: Context) -> Handoff:
@@ -46,6 +49,15 @@ class Frame(Dissector):
         reader.add("frame.cap_len", packet.captured_length)
         if packet.timestamp_ns is not None:
             reader.add("frame.time_epoch", packet.timestamp_ns)
+        interface = packet.interface
+        if interface is not None and interface.name is not None:
+            reader.add("frame.interface_name", interface.name)
+        if interface is not None and interface.description is not None:
+            reader.add("frame.interface_description", interface.description)
+        # Whoever saved the capture can attach notes to a packet, which
+        # pcapng keeps with it.
+        for comment in packet.comments:
+            reader.add("frame.comment", comment)
         reader.summarize(
             f"Frame {context.number}: {packet.original_length} bytes on wire, "
             f"{packet.captured_length} bytes captured"

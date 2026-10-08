@@ -24,16 +24,16 @@ from typing import NoReturn, TextIO
 
 import pilotfish.core.protocols  # noqa: F401  (registers the dissectors)
 from pilotfish import __version__
-from pilotfish.cli import capture, explain, fields, follow, interfaces, read
+from pilotfish.cli import capture, explain, fields, follow, interfaces, merge, read
 from pilotfish.cli.export import FieldPicker, FieldsFormat, FieldsPrinter, JsonPrinter
 from pilotfish.cli.pipeline import Pipeline, Printer, TextPrinter, open_output
 from pilotfish.cli.status import CommandError, Exit
 from pilotfish.cli.table import TIME_FORMATS
 from pilotfish.core.capture import DEFAULT_QUEUE_SIZE, MAX_SNAPLEN, CaptureOptions, PacketSource
 from pilotfish.core.dissect import REGISTRY
-from pilotfish.core.formats import FileFormat, open_writer
+from pilotfish.core.formats import CaptureWriter, FileFormat, RingBuffer, RingLimits, open_writer
 
-COMMANDS = ("read", "capture", "follow", "fields", "interfaces", "filter")
+COMMANDS = ("read", "capture", "merge", "follow", "fields", "interfaces", "filter")
 
 OUTPUT_TYPES = ("text", "fields", "json")
 
@@ -205,6 +205,16 @@ def _add_packet_options(parser: argparse.ArgumentParser) -> None:
         choices=tuple(FileFormat),
         help="the format -w writes: pcapng (default) or pcap",
     )
+    saved.add_argument(
+        "-b",
+        "--ring-buffer",
+        dest="ring",
+        action="append",
+        metavar="KEY:VALUE",
+        help="write a ring of files instead of one, as dumpcap does: filesize:KB starts a "
+        "new file once one holds that many kilobytes, duration:SECONDS once its packets "
+        "span that long, and files:N keeps only the newest N",
+    )
 
 
 def _add_live_options(parser: argparse.ArgumentParser) -> None:
@@ -351,6 +361,35 @@ def build_parser() -> argparse.ArgumentParser:
         "was compiled to, or what is wrong with it and where.",
     )
     filter_parser.add_argument("expression", help="display filter, such as 'tcp.port == 80'")
+
+    merge_parser = commands.add_parser(
+        "merge",
+        help="merge capture files into one, in time order, as mergecap does",
+        description="Merge capture files into one, their packets in the order they were "
+        "captured. Every interface keeps its description and every packet its comments.",
+        epilog=EXIT_STATUSES,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    merge_parser.add_argument("files", nargs="+", metavar="FILE", help="capture files to merge")
+    merge_parser.add_argument(
+        "-w",
+        "--write",
+        required=True,
+        metavar="FILE",
+        help="the file to write, or - for standard output",
+    )
+    merge_parser.add_argument(
+        "-F",
+        "--format",
+        choices=tuple(FileFormat),
+        help="the format to write: pcapng (default) or pcap",
+    )
+    merge_parser.add_argument(
+        "-a",
+        "--concatenate",
+        action="store_true",
+        help="put the files one after another, in the order given, instead of merging by time",
+    )
     return parser
 
 
@@ -391,6 +430,13 @@ def _run(args: argparse.Namespace) -> Exit:
             return interfaces.run()
         case "filter":
             return explain.run(args.expression)
+        case "merge":
+            return merge.run(
+                args.files,
+                args.write,
+                FileFormat(args.format or FileFormat.PCAPNG),
+                concatenate=args.concatenate,
+            )
         case "read":
             return _packets(args, live=False)
         case "capture":
@@ -416,15 +462,24 @@ def _packets(args: argparse.Namespace, *, live: bool) -> Exit:
     with ExitStack() as stack:
 
         def pipeline(source: PacketSource | None = None) -> Pipeline:
-            writer = None
+            writer: CaptureWriter | None = None
             name = ""
-            if args.write is not None:
+            file_format = FileFormat(args.format or FileFormat.PCAPNG)
+            if args.ring:
+                name = args.write
+                writer = RingBuffer(
+                    Path(args.write),
+                    file_format,
+                    _ring_limits(args.ring),
+                    link_type=None if source is None else source.link_type,
+                )
+            elif args.write is not None:
                 stream, name = open_output(args.write)
                 if stream is not sys.stdout.buffer:
                     stack.enter_context(stream)
                 writer = open_writer(
                     stream,
-                    FileFormat(args.format or FileFormat.PCAPNG),
+                    file_format,
                     link_type=None if source is None else source.link_type,
                     interface_names={} if source is None else {0: source.interface},
                 )
@@ -514,6 +569,13 @@ def _check(args: argparse.Namespace, *, live: bool) -> None:
         raise _usage("-V prints the protocol tree, and -T fields prints only the fields")
     if args.format is not None and args.write is None:
         raise _usage("-F says which format -w writes; add -w FILE")
+    if args.ring:
+        if args.write is None or args.write == "-":
+            raise _usage("-b writes a ring of files, so it needs -w FILE to name them by")
+        _ring_limits(args.ring)
+        folder = Path(args.write).parent
+        if not folder.is_dir():
+            raise CommandError(Exit.OPEN_ERROR, f"{folder}: No such directory")
     if args.print_filter and args.filter is None:
         raise _usage("-d prints a capture filter's program; give the filter with -f")
     if args.write == "-" and not args.quiet and _asked_to_print(args):
@@ -521,6 +583,28 @@ def _check(args: argparse.Namespace, *, live: bool) -> None:
             "-w - writes the capture to standard output, so packets can't be printed there "
             "too; write it to a file, or drop -P, -T, -V and -x"
         )
+
+
+def _ring_limits(options: list[str]) -> RingLimits:
+    """The ring buffer's limits from dumpcap's -b KEY:VALUE flags."""
+    values: dict[str, int] = {}
+    for option in options:
+        key, colon, text = option.partition(":")
+        if not colon or key not in {"filesize", "duration", "files"}:
+            raise _usage(
+                f'"{option}" isn\'t a -b option; they are filesize:KB, duration:SECONDS and files:N'
+            )
+        if not text.isdecimal() or int(text) < 1:
+            raise _usage(f'-b {key} takes a whole number above 0, not "{text}"')
+        values[key] = int(text)
+    if "filesize" not in values and "duration" not in values:
+        raise _usage("-b needs filesize:KB or duration:SECONDS to know when to start a new file")
+    size = values.get("filesize")
+    return RingLimits(
+        max_bytes=None if size is None else size * 1_000,
+        max_seconds=values.get("duration"),
+        max_files=values.get("files"),
+    )
 
 
 def _usage(message: str) -> CommandError:

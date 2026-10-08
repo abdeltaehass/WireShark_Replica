@@ -13,7 +13,7 @@ against real tshark output.
 HTTP, TLS and SSH, puts messages that span packets back together, follows a
 TCP stream from end to end, and picks packets out with display filters in
 Wireshark's syntax. The command line tool takes tshark's flags, prints JSON,
-fields and hex dumps, and saves pcap and pcapng files.
+fields and hex dumps, and saves, splits and merges pcap and pcapng files.
 
 ## Install
 
@@ -90,7 +90,7 @@ Multicast Domain Name System (query)
     Class: 0x0001
 ```
 
-`uv run pilotfish fields` lists all 464 field names it can decode, with their
+`uv run pilotfish fields` lists all 467 field names it can decode, with their
 types. They are Wireshark's names, so `ip.src`, `tcp.flags` and
 `dns.qry.name` mean here what they mean there.
 
@@ -151,10 +151,37 @@ tree comes first.
 
 ### Saving
 
-`-w` writes the packets kept to a pcapng file, or a pcap file with `-F pcap`,
-with timestamps to the nanosecond. On its own it prints nothing; `-P` prints
-as well. `-w -` writes to standard output and `-r -` reads standard input,
-so captures go through pipes:
+`-w` writes the packets kept to a pcapng file, or a pcap file with `-F pcap`.
+On its own it prints nothing; `-P` prints as well. With `-Y` it saves only
+what the filter matches, which is Wireshark's File › Export Specified
+Packets:
+
+```console
+$ uv run pilotfish -r samples/wireshark-wiki/pcapng-example.pcapng -Y frame.comment -w commented.pcapng
+```
+
+What is written describes each interface as the file it was read from did —
+its name, snapshot length and timestamp resolution — and keeps every packet's
+comments, so a file read and written again has the same bytes, the same
+times and the same notes. A pcap file comes back identical byte for byte,
+unless it was big-endian, since pilotfish writes little-endian. pcap holds no
+comments, and one link type a file, so packets that need more
+are refused rather than quietly changed, with a suggestion to write pcapng.
+What is left out is what isn't about packets: name resolution, interface
+statistics and custom blocks.
+
+The comments can be searched like any field:
+
+```console
+$ uv run pilotfish -r samples/wireshark-wiki/pcapng-example.pcapng -Y frame.comment -T fields -e frame.number -e frame.comment
+42	Hello, world!
+289	The Answer to the Ultimate Question of Life, the Universe, and Everything
+290	The Answer to the Ultimate Question of Life, the Universe, and Everything
+314	Hello, world!
+```
+
+`-w -` writes to standard output and `-r -` reads standard input, so
+captures go through pipes:
 
 ```console
 $ uv run pilotfish -r samples/wireshark-wiki/http.cap -w - | uv run pilotfish -r - -Y http.request -T fields -e http.host
@@ -164,6 +191,34 @@ pagead2.googlesyndication.com
 
 `-r -` reads to the end of its input before decoding, so it is for files
 passed along a pipe rather than for watching a live one.
+
+### Long captures and merging
+
+For a capture left running, `-b` writes a ring of files the way dumpcap does:
+a new file once the last holds `filesize:KB` kilobytes or its packets span
+`duration:SECONDS`, and only the newest `files:N` kept. Each file is named
+for its number and its first packet's time in UTC, and each opens on its own:
+
+```console
+$ sudo .venv/bin/pilotfish -i en0 -w capture.pcapng -b duration:3600 -b files:24
+$ uv run pilotfish -r samples/wireshark-wiki/arp-storm.pcap -w storm.pcapng -b filesize:10 -b files:3
+$ ls
+storm_00004_20041005140118.pcapng  storm_00005_20041005140124.pcapng  storm_00006_20041005140130.pcapng
+```
+
+The first keeps the last day an hour a file. The second splits a saved
+capture by size, and the three oldest pieces are gone.
+
+`pilotfish merge` puts capture files together in the order their packets were
+captured, as mergecap does, or one after another with `-a`. Each file is
+already in time order, so this is the last step of a merge sort:
+`heapq.merge` holds the next packet of each file and hands out the earliest,
+which merges files of any size in the memory one packet from each takes.
+Interfaces that describe themselves the same way in several files become one.
+
+```console
+$ uv run pilotfish merge -w both.pcapng samples/wireshark-wiki/dns.cap samples/wireshark-wiki/http.cap
+```
 
 ### Exit status
 
@@ -516,7 +571,10 @@ flowchart LR
   ever be marked malformed. Display filters are generated at random too, and
   the compiled function has to agree with the tree walk on every one. The
   JSON the command line prints is read back and held to tshark's the same
-  way, and its fields and hex dumps to tshark's own output.
+  way, and its fields and hex dumps to tshark's own output. Every sample is
+  written out again as pcapng and as pcap, and has to read back with the same
+  bytes, times and comments, and to read in tshark exactly as the original
+  does.
 
 | Path | Contents |
 |---|---|
@@ -527,7 +585,7 @@ flowchart LR
 | `src/pilotfish/core/protocols/` | one module per protocol |
 | `src/pilotfish/core/reassembly/` | fragments and TCP streams, put back in order |
 | `src/pilotfish/core/follow.py` | following a TCP stream |
-| `src/pilotfish/core/formats/` | pcap and pcapng: reading and writing |
+| `src/pilotfish/core/formats/` | pcap and pcapng: reading, writing, ring buffers and merging |
 | `src/pilotfish/cli/` | command line tool: flags, the packet pipeline, text, JSON, fields and hex output |
 | `src/pilotfish/gui/` | PySide6 desktop app |
 | `tests/`, `samples/`, `scripts/` | tests, capture files with answer keys, dev tools |
@@ -570,7 +628,7 @@ tests don't: their output for each sample is saved in the repo. See
 
 - [x] Phase 10: display filters
 - [x] Phase 11: the command line tool
-- [ ] Phase 12: saving and exporting files
+- [x] Phase 12: saving and exporting files
 
 ## Capture responsibly
 

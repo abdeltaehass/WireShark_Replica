@@ -675,3 +675,36 @@ class TestFieldPicker:
         with pytest.raises(CommandError):
             FieldPicker(["ip.src"], fields)
         assert FieldPicker(["t.x"], fields).names == ("t.x",)
+
+
+EXAMPLE = SAMPLES / "wireshark-wiki" / "pcapng-example.pcapng"
+
+
+class TestExport:
+    """Saving only what a display filter matches, as Wireshark's File > Export does."""
+
+    def test_comments_can_be_filtered_on(self, capsys: pytest.CaptureFixture[str]) -> None:
+        text = output(
+            capsys,
+            *("-r", str(EXAMPLE), "-Y", 'frame.comment contains "Answer"'),
+            *("-T", "fields", "-e", "frame.number", "-e", "frame.interface_name"),
+        )
+        assert text == "289\tany\n290\tany\n"
+
+    def test_the_tree_shows_them(self, capsys: pytest.CaptureFixture[str]) -> None:
+        text = output(capsys, "-r", str(EXAMPLE), "-Y", "frame.number == 42", "-V")
+        assert "    Interface name: ens160\n    Comment: Hello, world!\n" in text
+
+    def test_what_is_exported_keeps_its_comments_and_resolution(self, tmp_path: Path) -> None:
+        exported = tmp_path / "commented.pcapng"
+        assert main(["-r", str(EXAMPLE), "-Y", "frame.comment", "-w", str(exported)]) == Exit.OK
+        with CaptureFile(EXAMPLE) as original:
+            wanted = [each for each in original if each.comments]
+        with CaptureFile(exported) as copy:
+            kept = list(copy)
+        assert [(each.timestamp_ns, bytes(each.data), each.comments) for each in kept] == [
+            (each.timestamp_ns, bytes(each.data), each.comments) for each in wanted
+        ]
+        assert {each.interface.units_per_second for each in kept if each.interface} == {
+            1_000_000_000
+        }

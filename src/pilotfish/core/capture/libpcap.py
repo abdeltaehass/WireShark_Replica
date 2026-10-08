@@ -37,7 +37,7 @@ from pilotfish.core.capture.source import CaptureOptions, KernelStats
 from pilotfish.core.filters.errors import FilterError
 from pilotfish.core.filters.program import Instruction, Program
 from pilotfish.core.linktypes import link_type_from_dlt
-from pilotfish.core.packet import Packet
+from pilotfish.core.packet import MICROSECONDS, Interface, Packet
 from pilotfish.core.timestamps import NS_PER_SECOND
 
 LIBPCAP_PATH = "/usr/lib/libpcap.A.dylib"
@@ -318,6 +318,11 @@ class PcapSource:
                 raise CaptureError(message)
             self.warning = _message(lib, handle, status) if status > 0 else None
             self.link_type = link_type_from_dlt(lib.pcap_datalink(handle))
+            # What a capture file written from these packets says about where
+            # they came from. libpcap hands out times in microseconds.
+            self.description = Interface(
+                self.link_type, options.snaplen, MICROSECONDS, name=interface
+            )
             self.program: Program | None = None
             if options.filter is not None:
                 # Compiling against this handle uses its own link type and
@@ -346,6 +351,7 @@ class PcapSource:
                 link_type=self.link_type,
                 # libpcap reuses its buffer on the next call, so copy the bytes out now.
                 data=ctypes.string_at(self._data, header.caplen),
+                interface=self.description,
             )
         if status == 0:
             return None
