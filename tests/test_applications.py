@@ -305,6 +305,40 @@ class TestHttp:
         assert tree.get("http.file_data") == b"no!"
         assert tree.info == "HTTP/1.1 404 Not Found  (text/plain)"
 
+    def test_each_part_of_a_message_points_at_its_bytes(self) -> None:
+        # Selecting a field in the desktop app lights up these bytes.
+        message = b"GET /a?b=1 HTTP/1.1\r\nHost: example.com\r\n\r\n"
+        data = over_tcp(message)
+        start = data.index(message)
+        tree = decode(data)
+
+        def bytes_of(name: str) -> bytes:
+            node = tree.find(name)
+            assert node is not None
+            assert node.source is None
+            return data[node.offset : node.offset + node.length]
+
+        assert bytes_of("http.request.method") == b"GET"
+        assert bytes_of("http.request.uri") == b"/a?b=1"
+        assert bytes_of("http.request.uri.query") == b"/a?b=1"  # inside the URI
+        assert bytes_of("http.request.version") == b"HTTP/1.1"
+        assert bytes_of("http.request") == b"GET /a?b=1 HTTP/1.1\r\n"
+        assert bytes_of("http.request.line") == b"Host: example.com\r\n"
+        assert bytes_of("http.host") == b"Host: example.com\r\n"
+        node = tree.find("http.request.method")
+        assert node is not None
+        assert node.offset == start
+
+        # With a length, so it doesn't wait for the connection to close.
+        answer = b"HTTP/1.1 404 Not Found\r\nServer: x\r\nContent-Length: 0\r\n\r\n"
+        data = over_tcp(answer, port=50000, source_port=80)
+        tree = decode(data)
+        assert bytes_of("http.response.version") == b"HTTP/1.1"
+        assert bytes_of("http.response.code") == b"404"
+        assert bytes_of("http.response.code.desc") == b"404"
+        assert bytes_of("http.response.phrase") == b"Not Found"
+        assert bytes_of("http.server") == b"Server: x\r\n"
+
     def test_a_body_sent_in_pieces_with_their_sizes_in_front(self) -> None:
         message = (
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"

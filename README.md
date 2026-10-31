@@ -13,7 +13,9 @@ against real tshark output.
 HTTP, TLS and SSH, puts messages that span packets back together, follows a
 TCP stream from end to end, and picks packets out with display filters in
 Wireshark's syntax. The command line tool takes tshark's flags, prints JSON,
-fields and hex dumps, and saves, splits and merges pcap and pcapng files.
+fields and hex dumps, and saves, splits and merges pcap and pcapng files. The
+desktop app opens a capture in Wireshark's three panes: the packet list, the
+protocol tree and the bytes.
 
 ## Install
 
@@ -466,6 +468,35 @@ $ uv run pilotfish follow samples/made/http-download.pcap 0 --raw server \
 response on the same connection.) That digest is the SHA-256 of the file the
 capture was built to carry, and a test holds pilotfish to it.
 
+## The desktop app
+
+```sh
+uv run pilotfish-gui samples/wireshark-wiki/http.cap
+```
+
+The window has Wireshark's three panes, one above the other. The packet list
+has the classic columns, No., Time, Source, Destination, Protocol, Length and
+Info, worked out exactly as the command line's. Time counts from the first
+packet, to as many decimals as the file records. Below it is the protocol
+tree of the packet selected, worded as `-V` words it, and under that the
+packet's bytes in hexadecimal and as text.
+
+The tree and the bytes are tied together both ways. Select a field and its
+bytes light up. Click a byte and the tree opens to the smallest field that
+holds it. A message put together from several packets is in none of them,
+so its bytes get a tab of their own beside the frame's, and selecting a field
+read from them switches to that tab. Subtrees opened on one packet stay open
+on the next.
+
+A capture of half a million packets opens in well under a second. The packet
+list decodes only the rows on screen: the file is indexed rather than read
+into memory, and a row is decoded when it first scrolls into view. Decoding
+still has to go in order, since whether a segment is a retransmission or
+what message it completes depends on the packets before it. So jumping far
+ahead decodes the packets in between a slice at a time, with the window free
+to use, while the status bar counts them. A packet selected before then shows
+its bytes at once and its tree when decoding reaches it.
+
 ## What it decodes
 
 | Layer | Protocols |
@@ -558,6 +589,14 @@ flowchart LR
   chose (the packet list, a tree, a hex dump, JSON, fields) and to the file
   being written. A packet is only decoded if something needs its tree, so
   saving a capture straight to disk costs no decoding.
+- **Opening a file in the app.** The file is memory-mapped and indexed: eight
+  bytes a packet, saying where it starts, so any packet can be read again
+  without holding them all. Decoding runs in order up to the furthest row
+  shown, and keeps each row's columns and, every thousand packets or so, a
+  checkpoint: the session pickled. A packet whose columns were let go, or
+  whose tree is wanted, is decoded again from the checkpoint before it, which
+  gives exactly the tree the first pass gave. Checkpoints are kept within a
+  fixed count and size by dropping every other one as they grow.
 - **Staying small.** Whoever sends the packets chooses what they claim, so
   everything kept for later has a limit: fragments that never complete are
   dropped after thirty seconds or once four megabytes are waiting, a stream
@@ -585,9 +624,11 @@ flowchart LR
 | `src/pilotfish/core/protocols/` | one module per protocol |
 | `src/pilotfish/core/reassembly/` | fragments and TCP streams, put back in order |
 | `src/pilotfish/core/follow.py` | following a TCP stream |
-| `src/pilotfish/core/formats/` | pcap and pcapng: reading, writing, ring buffers and merging |
+| `src/pilotfish/core/formats/` | pcap and pcapng: reading, writing, indexing, ring buffers and merging |
+| `src/pilotfish/core/decoder.py` | decoding any packet on demand, from checkpoints |
+| `src/pilotfish/core/columns.py` | the packet list's columns, shared by both front ends |
 | `src/pilotfish/cli/` | command line tool: flags, the packet pipeline, text, JSON, fields and hex output |
-| `src/pilotfish/gui/` | PySide6 desktop app |
+| `src/pilotfish/gui/` | PySide6 desktop app: the packet list, the protocol tree and the bytes |
 | `tests/`, `samples/`, `scripts/` | tests, capture files with answer keys, dev tools |
 
 The core is standard library only and never imports the CLI, the GUI or a
@@ -596,7 +637,7 @@ third-party packet library; a test fails the build if that changes.
 ## Development
 
 ```sh
-uv run pytest                                          # the test suite
+uv run pytest                                          # the test suite, the app's offscreen
 uv run ruff check && uv run ruff format --check        # lint and format
 uv run mypy                                            # types, strict
 uv run pytest tests/test_fuzz.py --hypothesis-profile=fuzz   # longer fuzzing
@@ -629,6 +670,10 @@ tests don't: their output for each sample is saved in the repo. See
 - [x] Phase 10: display filters
 - [x] Phase 11: the command line tool
 - [x] Phase 12: saving and exporting files
+
+**Stage 4: The desktop app**
+
+- [x] Phase 13: the three-pane window
 
 ## Capture responsibly
 

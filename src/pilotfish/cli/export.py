@@ -19,10 +19,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, TextIO
 
-from pilotfish.cli.detail import format_value
 from pilotfish.cli.status import CommandError, Exit
-from pilotfish.cli.table import DESTINATIONS, SOURCES, TimeFormat, address, protocol, summary
+from pilotfish.cli.table import TimeFormat
+from pilotfish.core.columns import DESTINATIONS, SOURCES, address, protocol, summary
 from pilotfish.core.dissect import FieldRegistry, FieldType, Node, ProtocolTree
+from pilotfish.core.dissect.text import format_value
 from pilotfish.core.packet import Packet
 from pilotfish.core.timestamps import NS_PER_SECOND, format_epoch, format_utc
 

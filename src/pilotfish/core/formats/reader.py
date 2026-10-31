@@ -79,6 +79,14 @@ class CaptureFile:
     def __iter__(self) -> Iterator[Packet]:
         return iter(self._reader)
 
+    def records(self) -> Iterator[tuple[int, Packet]]:
+        """Each packet with the offset it starts at in the file."""
+        return self._reader.records()
+
+    def packet_at(self, offset: int) -> Packet:
+        """The packet starting at an offset :meth:`records` gave."""
+        return self._reader.packet_at(offset)
+
     def close(self) -> None:
         self._reader.close()
         self._close_mapping()

@@ -15,8 +15,10 @@ Block. Other block types are skipped.
 Reference: https://datatracker.ietf.org/doc/draft-ietf-opsawg-pcapng/
 """
 
+import bisect
 import struct
 from collections.abc import Iterator
+from dataclasses import dataclass, field
 
 from pilotfish.core.formats.errors import CaptureFileError
 from pilotfish.core.formats.pcap import ByteOrder
@@ -64,6 +66,18 @@ _OPTION = _structs("HH")
 _I64 = _structs("q")
 
 
+_PACKET_BLOCKS = frozenset({BLOCK_ENHANCED_PACKET, BLOCK_SIMPLE_PACKET, BLOCK_PACKET})
+
+
+@dataclass(slots=True)
+class _Section:
+    """What reading a packet block needs to know about the section it is in."""
+
+    start: int
+    byte_order: ByteOrder
+    interfaces: list[Interface] = field(default_factory=list)
+
+
 class PcapngReader:
     """Iterates over the packets of a pcapng file held in memory."""
 
@@ -71,74 +85,37 @@ class PcapngReader:
         if len(data) < 4 or data[:4] != SECTION_HEADER_MAGIC:
             raise CaptureFileError("not a pcapng file (no Section Header Block at the start)")
         self._data = data
+        # The sections read so far, so a packet can be read again from its
+        # offset with its section's byte order and interfaces.
+        self._sections: list[_Section] = []
 
     def __iter__(self) -> Iterator[Packet]:
+        return (packet for _, packet in self.records())
+
+    def records(self) -> Iterator[tuple[int, Packet]]:
+        """Each packet with the offset of its block, to read it again by."""
         data = self._data
         end = len(data)
-        byte_order: ByteOrder = "<"
-        interfaces: list[Interface] = []
+        self._sections = []
+        section = _Section(0, "<")
         offset = 0
         while offset < end:
             if end - offset < _FRAMING:
                 raise CaptureFileError(f"block at offset {offset} is cut short")
-            block_type, total_length = _BLOCK_HEADER[byte_order].unpack_from(data, offset)
+            block_type, total_length = _BLOCK_HEADER[section.byte_order].unpack_from(data, offset)
             if block_type == BLOCK_SECTION_HEADER:
                 # The type reads the same in either byte order; the magic after
                 # the length says which order this section uses.
-                byte_order = _section_byte_order(data, offset)
-                (total_length,) = _U32[byte_order].unpack_from(data, offset + 4)
-                interfaces = []
+                section = _Section(offset, _section_byte_order(data, offset))
+                self._sections.append(section)
+                (total_length,) = _U32[section.byte_order].unpack_from(data, offset + 4)
+            byte_order = section.byte_order
             body_start, body_end = _check_block(data, offset, block_type, total_length, byte_order)
 
-            if block_type == BLOCK_ENHANCED_PACKET:
-                interface_id, high, low, captured_length, original_length = _ENHANCED_PACKET[
-                    byte_order
-                ].unpack_from(data, body_start)
-                interface = _interface(interfaces, interface_id, offset)
-                yield Packet(
-                    timestamp_ns=interface.timestamp_ns((high << 32) | low),
-                    original_length=original_length,
-                    link_type=interface.link_type,
-                    data=_packet_data(data, body_start + 20, body_end, captured_length, offset),
-                    interface_id=interface_id,
-                    interface=interface,
-                    comments=_comments(
-                        data, body_start + 20, body_end, captured_length, byte_order
-                    ),
-                )
-            elif block_type == BLOCK_SIMPLE_PACKET:
-                # No interface ID or timestamp: the packet belongs to interface 0,
-                # and the capture length is the original length cut to its snap length.
-                (original_length,) = _U32[byte_order].unpack_from(data, body_start)
-                interface = _interface(interfaces, 0, offset)
-                captured_length = original_length
-                if interface.snaplen:
-                    captured_length = min(captured_length, interface.snaplen)
-                yield Packet(
-                    timestamp_ns=None,
-                    original_length=original_length,
-                    link_type=interface.link_type,
-                    data=_packet_data(data, body_start + 4, body_end, captured_length, offset),
-                    interface=interface,
-                )
-            elif block_type == BLOCK_PACKET:
-                interface_id, _drops, high, low, captured_length, original_length = _PACKET[
-                    byte_order
-                ].unpack_from(data, body_start)
-                interface = _interface(interfaces, interface_id, offset)
-                yield Packet(
-                    timestamp_ns=interface.timestamp_ns((high << 32) | low),
-                    original_length=original_length,
-                    link_type=interface.link_type,
-                    data=_packet_data(data, body_start + 20, body_end, captured_length, offset),
-                    interface_id=interface_id,
-                    interface=interface,
-                    comments=_comments(
-                        data, body_start + 20, body_end, captured_length, byte_order
-                    ),
-                )
+            if block_type in _PACKET_BLOCKS:
+                yield offset, _packet(data, offset, block_type, body_start, body_end, section)
             elif block_type == BLOCK_INTERFACE_DESCRIPTION:
-                interfaces.append(_parse_interface(data, body_start, body_end, byte_order))
+                section.interfaces.append(_parse_interface(data, body_start, body_end, byte_order))
             elif block_type == BLOCK_SECTION_HEADER:
                 _, major, minor, _ = _SECTION_HEADER[byte_order].unpack_from(data, body_start)
                 if major != 1:
@@ -147,8 +124,74 @@ class PcapngReader:
                     )
             offset += total_length
 
+    def packet_at(self, offset: int) -> Packet:
+        """The packet whose block starts at ``offset``.
+
+        Only for a block :meth:`records` has already passed, since the
+        interfaces a packet refers to are described earlier in its section.
+        """
+        found = bisect.bisect_right(self._sections, offset, key=lambda section: section.start)
+        if not found:
+            raise CaptureFileError(f"no section of the file read so far holds offset {offset}")
+        section = self._sections[found - 1]
+        data = self._data
+        if len(data) - offset < _FRAMING:
+            raise CaptureFileError(f"block at offset {offset} is cut short")
+        block_type, total_length = _BLOCK_HEADER[section.byte_order].unpack_from(data, offset)
+        if block_type not in _PACKET_BLOCKS:
+            raise CaptureFileError(f"the block at offset {offset} doesn't hold a packet")
+        body_start, body_end = _check_block(
+            data, offset, block_type, total_length, section.byte_order
+        )
+        return _packet(data, offset, block_type, body_start, body_end, section)
+
     def close(self) -> None:
         self._data.release()
+
+
+def _packet(
+    data: memoryview,
+    offset: int,
+    block_type: int,
+    body_start: int,
+    body_end: int,
+    section: _Section,
+) -> Packet:
+    """The packet in a packet block whose framing has been checked."""
+    byte_order = section.byte_order
+    if block_type == BLOCK_SIMPLE_PACKET:
+        # No interface ID or timestamp: the packet belongs to interface 0,
+        # and the capture length is the original length cut to its snap length.
+        (original_length,) = _U32[byte_order].unpack_from(data, body_start)
+        interface = _interface(section.interfaces, 0, offset)
+        captured_length = original_length
+        if interface.snaplen:
+            captured_length = min(captured_length, interface.snaplen)
+        return Packet(
+            timestamp_ns=None,
+            original_length=original_length,
+            link_type=interface.link_type,
+            data=_packet_data(data, body_start + 4, body_end, captured_length, offset),
+            interface=interface,
+        )
+    if block_type == BLOCK_ENHANCED_PACKET:
+        interface_id, high, low, captured_length, original_length = _ENHANCED_PACKET[
+            byte_order
+        ].unpack_from(data, body_start)
+    else:
+        interface_id, _drops, high, low, captured_length, original_length = _PACKET[
+            byte_order
+        ].unpack_from(data, body_start)
+    interface = _interface(section.interfaces, interface_id, offset)
+    return Packet(
+        timestamp_ns=interface.timestamp_ns((high << 32) | low),
+        original_length=original_length,
+        link_type=interface.link_type,
+        data=_packet_data(data, body_start + 20, body_end, captured_length, offset),
+        interface_id=interface_id,
+        interface=interface,
+        comments=_comments(data, body_start + 20, body_end, captured_length, byte_order),
+    )
 
 
 def _section_byte_order(data: memoryview, offset: int) -> ByteOrder:

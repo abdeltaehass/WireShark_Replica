@@ -10,6 +10,7 @@ dependencies = []
 
 [project.scripts]
 pilotfish = "pilotfish.cli.main:main"
+pilotfish-gui = "pilotfish.gui.app:main"
 
 [project.optional-dependencies]
 gui = [

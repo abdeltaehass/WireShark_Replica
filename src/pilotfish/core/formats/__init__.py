@@ -1,6 +1,7 @@
 """Reading, writing and merging pcap and pcapng capture files."""
 
 from pilotfish.core.formats.errors import CaptureFileError
+from pilotfish.core.formats.index import PacketIndex
 from pilotfish.core.formats.merge import merge
 from pilotfish.core.formats.pcap import PcapHeader, PcapReader
 from pilotfish.core.formats.pcapng import PcapngReader
@@ -21,6 +22,7 @@ __all__ = [
     "CaptureWriter",
     "FileFormat",
     "Interface",
+    "PacketIndex",
     "PcapHeader",
     "PcapReader",
     "PcapWriter",

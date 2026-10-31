@@ -16,6 +16,7 @@ Reference: RFC 9112 for the syntax, RFC 9110 for what the headers mean.
 import zlib
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import TypedDict
 
 from pilotfish.core.dissect import (
     Buffer,
@@ -143,6 +144,22 @@ REASONS = {
 }
 
 
+class _Place(TypedDict):
+    """Where a field's bytes are, as :meth:`Reader.add` takes it."""
+
+    offset: int
+    length: int
+
+
+def _places(start: int, words: list[str]) -> list[_Place]:
+    """Where each word of a line split at single spaces starts, and how long it is."""
+    places: list[_Place] = []
+    for word in words:
+        places.append({"offset": start, "length": len(word)})
+        start += len(word) + 1
+    return places
+
+
 @dataclass(slots=True)
 class Requested:
     """A request this capture has seen, waiting for its answer."""
@@ -266,32 +283,39 @@ class Http(Dissector):
         """The start line, which says whether this is a request or an answer.
 
         A request names a method and what it wants; a response names the
-        version it speaks and how the request went.
+        version it speaks and how the request went. Each word points at its
+        own bytes, so selecting one in the tree lights up just that word.
         """
         words = first.split(" ")
+        places = _places(reader.buffer.offset, words)
+        line: _Place = {"offset": reader.buffer.offset, "length": len(first) + 2}
         if words[0].startswith("HTTP/"):
             reader.skip(len(first) + 2, "http.response.line")
-            reader.add("http.response.version", words[0])
+            reader.add("http.response.version", words[0], **places[0])
             code = int(words[1]) if len(words) > 1 and words[1].isdigit() else 0
-            reader.add("http.response.code", code)
+            reader.add("http.response.code", code, **(places[1] if len(words) > 1 else line))
             with reader.inside():
                 reader.add("http.response.code.desc", REASONS.get(code, "Unknown"))
-            reader.add("http.response.phrase", " ".join(words[2:]))
-            reader.add("http.response", True)
+            phrase = " ".join(words[2:])
+            where: _Place = (
+                {"offset": places[2]["offset"], "length": len(phrase)} if phrase else line
+            )
+            reader.add("http.response.phrase", phrase, **where)
+            reader.add("http.response", True, **line)
             return False
         reader.skip(len(first) + 2, "http.request.line")
-        reader.add("http.request.method", words[0])
+        reader.add("http.request.method", words[0], **places[0])
         if len(words) > 1:
-            self._uri(reader, words[1])
+            self._uri(reader, words[1], places[1])
         if len(words) > 2:
-            reader.add("http.request.version", words[2])
-        reader.add("http.request", True)
+            reader.add("http.request.version", words[2], **places[2])
+        reader.add("http.request", True, **line)
         return True
 
     @staticmethod
-    def _uri(reader: Reader, uri: str) -> None:
+    def _uri(reader: Reader, uri: str, place: _Place) -> None:
         """What the request asked for, and the query string if it has one."""
-        reader.add("http.request.uri", uri)
+        reader.add("http.request.uri", uri, **place)
         path, mark, query = uri.partition("?")
         if not mark:
             return
@@ -308,8 +332,11 @@ class Http(Dissector):
         headers: dict[str, str] = {}
         for raw in lines:
             line = raw.decode("latin-1")
+            offset = reader.buffer.offset
             reader.skip(len(raw) + 2, line_field)
-            reader.add(line_field, f"{line}\r\n")
+            # The fields a header line says point at the whole line, as
+            # Wireshark's do.
+            reader.add(line_field, f"{line}\r\n", offset=offset, length=len(raw) + 2)
             name, mark, value = line.partition(":")
             if not mark:
                 continue

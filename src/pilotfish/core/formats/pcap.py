@@ -99,41 +99,49 @@ class PcapReader:
             link_type=link_type & _LINK_TYPE_MASK,
         )
         self._data = data
+        self._record = _RECORDS[byte_order]
+        self._ns_per_tick = 1 if nanosecond else 1_000
+        self._interface = Interface(
+            self.header.link_type,
+            snaplen,
+            1_000_000_000 if nanosecond else 1_000_000,
+        )
 
     def __iter__(self) -> Iterator[Packet]:
+        return (packet for _, packet in self.records())
+
+    def records(self) -> Iterator[tuple[int, Packet]]:
+        """Each packet with the offset of its record, to read it again by."""
+        offset = HEADER_SIZE
+        end = len(self._data)
+        while offset < end:
+            packet = self.packet_at(offset)
+            yield offset, packet
+            offset += RECORD_SIZE + packet.captured_length
+
+    def packet_at(self, offset: int) -> Packet:
+        """The packet whose record starts at ``offset``."""
         data = self._data
         end = len(data)
-        record = _RECORDS[self.header.byte_order]
-        ns_per_tick = 1 if self.header.nanosecond else 1_000
-        link_type = self.header.link_type
-        interface = Interface(
-            link_type,
-            self.header.snaplen,
-            1_000_000_000 if self.header.nanosecond else 1_000_000,
-        )
-        offset = HEADER_SIZE
-        while offset < end:
-            if end - offset < RECORD_SIZE:
-                raise CaptureFileError(
-                    f"record header at offset {offset} is cut short: "
-                    f"{end - offset} of {RECORD_SIZE} bytes"
-                )
-            seconds, fraction, captured_length, original_length = record.unpack_from(data, offset)
-            start = offset + RECORD_SIZE
-            stop = start + captured_length
-            if stop > end:
-                raise CaptureFileError(
-                    f"packet at offset {offset} is cut short: "
-                    f"{end - start} of {captured_length} bytes"
-                )
-            yield Packet(
-                timestamp_ns=seconds * 1_000_000_000 + fraction * ns_per_tick,
-                original_length=original_length,
-                link_type=link_type,
-                data=data[start:stop],
-                interface=interface,
+        if end - offset < RECORD_SIZE:
+            raise CaptureFileError(
+                f"record header at offset {offset} is cut short: "
+                f"{end - offset} of {RECORD_SIZE} bytes"
             )
-            offset = stop
+        seconds, fraction, captured_length, original_length = self._record.unpack_from(data, offset)
+        start = offset + RECORD_SIZE
+        stop = start + captured_length
+        if stop > end:
+            raise CaptureFileError(
+                f"packet at offset {offset} is cut short: {end - start} of {captured_length} bytes"
+            )
+        return Packet(
+            timestamp_ns=seconds * 1_000_000_000 + fraction * self._ns_per_tick,
+            original_length=original_length,
+            link_type=self._interface.link_type,
+            data=data[start:stop],
+            interface=self._interface,
+        )
 
     def close(self) -> None:
         self._data.release()
