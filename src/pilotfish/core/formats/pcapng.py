@@ -17,7 +17,7 @@ Reference: https://datatracker.ietf.org/doc/draft-ietf-opsawg-pcapng/
 
 import bisect
 import struct
-from collections.abc import Iterator
+from collections.abc import Buffer, Iterator
 from dataclasses import dataclass, field
 
 from pilotfish.core.formats.errors import CaptureFileError
@@ -78,6 +78,86 @@ class _Section:
     interfaces: list[Interface] = field(default_factory=list)
 
 
+class PcapngBlocks:
+    """Reads a pcapng file's blocks one at a time, in order.
+
+    A packet block can only be read with the byte order and the interfaces of
+    the section it is in, so the sections are kept as they are read, by where
+    each one starts, to read any packet again later on its own.
+
+    The blocks can come from a file held whole or from a stream read a piece
+    at a time. ``base`` says how far into the file ``data`` starts, so offsets
+    in messages and the sections kept count from the start of the file
+    either way.
+    """
+
+    def __init__(self) -> None:
+        self.sections: list[_Section] = []
+
+    @property
+    def byte_order(self) -> ByteOrder:
+        """The byte order of the section being read, which the next block is in."""
+        return self.sections[-1].byte_order if self.sections else "<"
+
+    def frame(self, data: Buffer, offset: int, base: int = 0) -> tuple[int, int]:
+        """The type and total length of the block at ``offset``, from its first 12 bytes.
+
+        A section header reads the same in either byte order, and the magic
+        after its length says which order it and its section use.
+        """
+        block_type, total_length = _BLOCK_HEADER[self.byte_order].unpack_from(data, offset)
+        if block_type == BLOCK_SECTION_HEADER:
+            byte_order = _section_byte_order(data, offset, base)
+            (total_length,) = _U32[byte_order].unpack_from(data, offset + 4)
+        return block_type, total_length
+
+    def read(self, data: memoryview, offset: int, base: int = 0) -> Packet | None:
+        """Read the whole block at ``offset``, and return the packet it holds, if any."""
+        block_type, total_length = self.frame(data, offset, base)
+        if block_type == BLOCK_SECTION_HEADER:
+            self.sections.append(_Section(base + offset, _section_byte_order(data, offset, base)))
+        section = self.sections[-1] if self.sections else _Section(0, "<")
+        byte_order = section.byte_order
+        body_start, body_end = _check_block(
+            data, offset, block_type, total_length, byte_order, base
+        )
+        if block_type in _PACKET_BLOCKS:
+            return _packet(data, offset, block_type, body_start, body_end, section, base)
+        if block_type == BLOCK_INTERFACE_DESCRIPTION:
+            section.interfaces.append(
+                _parse_interface(data, body_start, body_end, byte_order, base)
+            )
+        elif block_type == BLOCK_SECTION_HEADER:
+            _, major, minor, _ = _SECTION_HEADER[byte_order].unpack_from(data, body_start)
+            if major != 1:
+                raise CaptureFileError(
+                    f"section at offset {base + offset} has unsupported pcapng version "
+                    f"{major}.{minor}"
+                )
+        return None
+
+    def section_at(self, position: int) -> _Section:
+        """The section holding the block at ``position`` in the file."""
+        found = bisect.bisect_right(self.sections, position, key=lambda section: section.start)
+        if not found:
+            raise CaptureFileError(f"no section of the file read so far holds offset {position}")
+        return self.sections[found - 1]
+
+    def packet(self, data: memoryview, offset: int, base: int = 0) -> Packet:
+        """The packet in the block at ``offset``, which :meth:`read` has passed."""
+        position = base + offset
+        section = self.section_at(position)
+        if len(data) - offset < _FRAMING:
+            raise CaptureFileError(f"block at offset {position} is cut short")
+        block_type, total_length = _BLOCK_HEADER[section.byte_order].unpack_from(data, offset)
+        if block_type not in _PACKET_BLOCKS:
+            raise CaptureFileError(f"the block at offset {position} doesn't hold a packet")
+        body_start, body_end = _check_block(
+            data, offset, block_type, total_length, section.byte_order, base
+        )
+        return _packet(data, offset, block_type, body_start, body_end, section, base)
+
+
 class PcapngReader:
     """Iterates over the packets of a pcapng file held in memory."""
 
@@ -85,9 +165,7 @@ class PcapngReader:
         if len(data) < 4 or data[:4] != SECTION_HEADER_MAGIC:
             raise CaptureFileError("not a pcapng file (no Section Header Block at the start)")
         self._data = data
-        # The sections read so far, so a packet can be read again from its
-        # offset with its section's byte order and interfaces.
-        self._sections: list[_Section] = []
+        self._blocks = PcapngBlocks()
 
     def __iter__(self) -> Iterator[Packet]:
         return (packet for _, packet in self.records())
@@ -96,32 +174,15 @@ class PcapngReader:
         """Each packet with the offset of its block, to read it again by."""
         data = self._data
         end = len(data)
-        self._sections = []
-        section = _Section(0, "<")
+        blocks = self._blocks = PcapngBlocks()
         offset = 0
         while offset < end:
             if end - offset < _FRAMING:
                 raise CaptureFileError(f"block at offset {offset} is cut short")
-            block_type, total_length = _BLOCK_HEADER[section.byte_order].unpack_from(data, offset)
-            if block_type == BLOCK_SECTION_HEADER:
-                # The type reads the same in either byte order; the magic after
-                # the length says which order this section uses.
-                section = _Section(offset, _section_byte_order(data, offset))
-                self._sections.append(section)
-                (total_length,) = _U32[section.byte_order].unpack_from(data, offset + 4)
-            byte_order = section.byte_order
-            body_start, body_end = _check_block(data, offset, block_type, total_length, byte_order)
-
-            if block_type in _PACKET_BLOCKS:
-                yield offset, _packet(data, offset, block_type, body_start, body_end, section)
-            elif block_type == BLOCK_INTERFACE_DESCRIPTION:
-                section.interfaces.append(_parse_interface(data, body_start, body_end, byte_order))
-            elif block_type == BLOCK_SECTION_HEADER:
-                _, major, minor, _ = _SECTION_HEADER[byte_order].unpack_from(data, body_start)
-                if major != 1:
-                    raise CaptureFileError(
-                        f"section at offset {offset} has unsupported pcapng version {major}.{minor}"
-                    )
+            _, total_length = blocks.frame(data, offset)
+            packet = blocks.read(data, offset)
+            if packet is not None:
+                yield offset, packet
             offset += total_length
 
     def packet_at(self, offset: int) -> Packet:
@@ -130,20 +191,7 @@ class PcapngReader:
         Only for a block :meth:`records` has already passed, since the
         interfaces a packet refers to are described earlier in its section.
         """
-        found = bisect.bisect_right(self._sections, offset, key=lambda section: section.start)
-        if not found:
-            raise CaptureFileError(f"no section of the file read so far holds offset {offset}")
-        section = self._sections[found - 1]
-        data = self._data
-        if len(data) - offset < _FRAMING:
-            raise CaptureFileError(f"block at offset {offset} is cut short")
-        block_type, total_length = _BLOCK_HEADER[section.byte_order].unpack_from(data, offset)
-        if block_type not in _PACKET_BLOCKS:
-            raise CaptureFileError(f"the block at offset {offset} doesn't hold a packet")
-        body_start, body_end = _check_block(
-            data, offset, block_type, total_length, section.byte_order
-        )
-        return _packet(data, offset, block_type, body_start, body_end, section)
+        return self._blocks.packet(self._data, offset)
 
     def close(self) -> None:
         self._data.release()
@@ -156,14 +204,16 @@ def _packet(
     body_start: int,
     body_end: int,
     section: _Section,
+    base: int = 0,
 ) -> Packet:
     """The packet in a packet block whose framing has been checked."""
     byte_order = section.byte_order
+    where = base + offset
     if block_type == BLOCK_SIMPLE_PACKET:
         # No interface ID or timestamp: the packet belongs to interface 0,
         # and the capture length is the original length cut to its snap length.
         (original_length,) = _U32[byte_order].unpack_from(data, body_start)
-        interface = _interface(section.interfaces, 0, offset)
+        interface = _interface(section.interfaces, 0, where)
         captured_length = original_length
         if interface.snaplen:
             captured_length = min(captured_length, interface.snaplen)
@@ -171,7 +221,7 @@ def _packet(
             timestamp_ns=None,
             original_length=original_length,
             link_type=interface.link_type,
-            data=_packet_data(data, body_start + 4, body_end, captured_length, offset),
+            data=_packet_data(data, body_start + 4, body_end, captured_length, where),
             interface=interface,
         )
     if block_type == BLOCK_ENHANCED_PACKET:
@@ -182,49 +232,55 @@ def _packet(
         interface_id, _drops, high, low, captured_length, original_length = _PACKET[
             byte_order
         ].unpack_from(data, body_start)
-    interface = _interface(section.interfaces, interface_id, offset)
+    interface = _interface(section.interfaces, interface_id, where)
     return Packet(
         timestamp_ns=interface.timestamp_ns((high << 32) | low),
         original_length=original_length,
         link_type=interface.link_type,
-        data=_packet_data(data, body_start + 20, body_end, captured_length, offset),
+        data=_packet_data(data, body_start + 20, body_end, captured_length, where),
         interface_id=interface_id,
         interface=interface,
-        comments=_comments(data, body_start + 20, body_end, captured_length, byte_order),
+        comments=_comments(data, body_start + 20, body_end, captured_length, byte_order, base),
     )
 
 
-def _section_byte_order(data: memoryview, offset: int) -> ByteOrder:
+def _section_byte_order(data: Buffer, offset: int, base: int = 0) -> ByteOrder:
     (magic,) = _U32["<"].unpack_from(data, offset + 8)
     if magic == BYTE_ORDER_MAGIC:
         return "<"
     (magic,) = _U32[">"].unpack_from(data, offset + 8)
     if magic == BYTE_ORDER_MAGIC:
         return ">"
-    raise CaptureFileError(f"section header at offset {offset} has a bad byte-order magic")
+    raise CaptureFileError(f"section header at offset {base + offset} has a bad byte-order magic")
 
 
 def _check_block(
-    data: memoryview, offset: int, block_type: int, total_length: int, byte_order: ByteOrder
+    data: memoryview,
+    offset: int,
+    block_type: int,
+    total_length: int,
+    byte_order: ByteOrder,
+    base: int = 0,
 ) -> tuple[int, int]:
     """Validate a block's framing and return where its body starts and ends."""
+    where = base + offset
     if total_length % 4:
         raise CaptureFileError(
-            f"block at offset {offset} has length {total_length}, which isn't a multiple of 4"
+            f"block at offset {where} has length {total_length}, which isn't a multiple of 4"
         )
     minimum = _FRAMING + _MIN_BODY.get(block_type, 0)
     if total_length < minimum:
         raise CaptureFileError(
-            f"block at offset {offset} has length {total_length}; this type needs {minimum}"
+            f"block at offset {where} has length {total_length}; this type needs {minimum}"
         )
     if offset + total_length > len(data):
         raise CaptureFileError(
-            f"block at offset {offset} is cut short: {len(data) - offset} of {total_length} bytes"
+            f"block at offset {where} is cut short: {len(data) - offset} of {total_length} bytes"
         )
     (trailing_length,) = _U32[byte_order].unpack_from(data, offset + total_length - 4)
     if trailing_length != total_length:
         raise CaptureFileError(
-            f"block at offset {offset} starts with length {total_length} "
+            f"block at offset {where} starts with length {total_length} "
             f"but ends with {trailing_length}"
         )
     return offset + 8, offset + total_length - 4
@@ -251,13 +307,13 @@ def _packet_data(
 
 
 def _parse_interface(
-    data: memoryview, body_start: int, body_end: int, byte_order: ByteOrder
+    data: memoryview, body_start: int, body_end: int, byte_order: ByteOrder, base: int = 0
 ) -> Interface:
     link_type, _, snaplen = _INTERFACE[byte_order].unpack_from(data, body_start)
     units_per_second = 1_000_000
     offset_seconds = 0
     name = description = None
-    for code, value in _options(data, body_start + 8, body_end, byte_order):
+    for code, value in _options(data, body_start + 8, body_end, byte_order, base):
         if code == OPTION_IF_TSRESOL and len(value) >= 1:
             # High bit clear: resolution is 10**-n seconds. Set: 2**-n seconds.
             exponent = value[0] & 0x7F
@@ -272,7 +328,12 @@ def _parse_interface(
 
 
 def _comments(
-    data: memoryview, start: int, body_end: int, captured_length: int, byte_order: ByteOrder
+    data: memoryview,
+    start: int,
+    body_end: int,
+    captured_length: int,
+    byte_order: ByteOrder,
+    base: int = 0,
 ) -> tuple[str, ...]:
     """The comments among a packet block's options, which follow its padded data."""
     options = start + ((captured_length + 3) & ~3)
@@ -280,7 +341,7 @@ def _comments(
         return ()
     return tuple(
         _text(value)
-        for code, value in _options(data, options, body_end, byte_order)
+        for code, value in _options(data, options, body_end, byte_order, base)
         if code == OPTION_COMMENT
     )
 
@@ -291,7 +352,7 @@ def _text(value: memoryview) -> str:
 
 
 def _options(
-    data: memoryview, start: int, end: int, byte_order: ByteOrder
+    data: memoryview, start: int, end: int, byte_order: ByteOrder, base: int = 0
 ) -> Iterator[tuple[int, memoryview]]:
     """Yield (code, value) for each option between ``start`` and ``end``."""
     header = _OPTION[byte_order]
@@ -302,6 +363,8 @@ def _options(
             return
         value_start = offset + 4
         if value_start + length > end:
-            raise CaptureFileError(f"option at offset {offset} runs past the end of its block")
+            raise CaptureFileError(
+                f"option at offset {base + offset} runs past the end of its block"
+            )
         yield code, data[value_start : value_start + length]
         offset = value_start + ((length + 3) & ~3)

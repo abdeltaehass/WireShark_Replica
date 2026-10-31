@@ -14,8 +14,8 @@ HTTP, TLS and SSH, puts messages that span packets back together, follows a
 TCP stream from end to end, and picks packets out with display filters in
 Wireshark's syntax. The command line tool takes tshark's flags, prints JSON,
 fields and hex dumps, and saves, splits and merges pcap and pcapng files. The
-desktop app opens a capture in Wireshark's three panes: the packet list, the
-protocol tree and the bytes.
+desktop app opens a capture in Wireshark's three panes, the packet list, the
+protocol tree and the bytes, and captures live, filtering as it goes.
 
 ## Install
 
@@ -263,9 +263,11 @@ Capturing on lo0 (Loopback)
 0 packets dropped by pilotfish (queue full)
 ```
 
-- Capturing needs access to `/dev/bpf*`, which is root-only by default, so run
-  it with sudo for now. Use the venv's script directly, as above — `sudo uv run`
-  would run uv itself as root.
+- Capturing needs access to `/dev/bpf*`, which is root-only by default. Run
+  `sudo .venv/bin/pilotfish bpf-access install` once and you capture without
+  sudo from then on, as the next section explains. Until then use sudo, with
+  the venv's script directly as above, since `sudo uv run` would run uv
+  itself as root.
 - Ctrl+C stops cleanly and reports what was dropped, in tcpdump's wording.
 - `uv run pilotfish -D` lists what you can capture on, and
   `uv run pilotfish interfaces` adds each one's status and addresses (en0 is
@@ -277,6 +279,29 @@ Capturing on lo0 (Loopback)
 
 On Wi-Fi you mostly see your own Mac's traffic plus broadcast and multicast.
 That's normal: the card only passes up frames addressed to this Mac.
+
+### Capturing without sudo
+
+macOS makes the BPF devices again at every boot, readable by root alone, so
+a `chmod` doesn't last. Wireshark solves this with a launch daemon that runs
+at boot and hands the devices to a group, `access_bpf`, and pilotfish does
+the same:
+
+```sh
+sudo .venv/bin/pilotfish bpf-access install
+```
+
+That writes the daemon to `/Library/LaunchDaemons` and its script to
+`/Library/Application Support/pilotfish`, makes the group if it isn't there,
+adds you to it and runs the daemon straight away. Joining a group counts
+from your next login. It takes an administrator once; after it, neither
+`pilotfish` nor the desktop app nor its capture helper needs sudo. The
+daemon gives the group read access only, which is all capturing needs;
+writing to a BPF device sends packets, which pilotfish never does. If
+Wireshark's own ChmodBPF is installed already, you are set up, and the two
+can live side by side. `pilotfish bpf-access` says how things stand and what
+is missing, and `sudo .venv/bin/pilotfish bpf-access uninstall` takes the
+daemon away.
 
 ## Capture filters
 
@@ -488,6 +513,36 @@ so its bytes get a tab of their own beside the frame's, and selecting a field
 read from them switches to that tab. Subtrees opened on one packet stay open
 on the next.
 
+### Capturing in the app
+
+With nothing open, the window lists the interfaces to capture on, each with
+a graph of its traffic over the last minute, so the busy one is easy to
+spot. Double-click one, or press Start (⌘E), to capture. Stop (⌘E) keeps what
+was captured, and Restart (⌘R) throws it away and starts again. A capture
+filter typed above the list applies in the kernel, as `-f` does.
+
+Capture runs in a helper process, `python -m pilotfish.helper`, which writes
+pcapng to the app over a pipe, the way Wireshark runs dumpcap. Keeping it
+apart means decoding in the window never holds up the capture thread in
+Python's GIL. What arrives is kept in a temporary pcapng file and indexed
+like a file on disk. New rows go into the list in batches ten times a
+second, so a burst of thousands of packets is one update rather than
+thousands, and the list follows the newest packet unless you scroll up.
+
+The display filter bar takes Wireshark's filters, and turns green or red as
+you type, with what is wrong in the status bar. Applied during a capture, it
+keeps deciding as packets come. The status bar counts packets captured,
+displayed and dropped. Capturing a 100 MB download over HTTPS, with a filter
+applied partway through, the app took in all 77,588 packets with none
+dropped, decoding kept up as they came, and the window was never held up
+for longer than 30 ms.
+
+If capture isn't allowed yet, the app says why and offers to install the
+launch daemon described under [capturing without sudo](#capturing-without-sudo);
+macOS asks for the administrator password itself.
+
+### Large files
+
 A capture of half a million packets opens in well under a second. The packet
 list decodes only the rows on screen: the file is indexed rather than read
 into memory, and a row is decoded when it first scrolls into view. Decoding
@@ -597,6 +652,11 @@ flowchart LR
   whose tree is wanted, is decoded again from the checkpoint before it, which
   gives exactly the tree the first pass gave. Checkpoints are kept within a
   fixed count and size by dropping every other one as they grow.
+- **Capturing in the app.** A helper process captures and writes pcapng to
+  a pipe; the app reads it a megabyte at a time between repaints, spools the
+  finished blocks to a temporary file and indexes them, so a long capture
+  holds eight bytes a packet in memory. With a display filter, every packet
+  is decoded in order as it arrives, and the ones that match become rows.
 - **Staying small.** Whoever sends the packets chooses what they claim, so
   everything kept for later has a limit: fragments that never complete are
   dropped after thirty seconds or once four megabytes are waiting, a stream
@@ -617,18 +677,19 @@ flowchart LR
 
 | Path | Contents |
 |---|---|
-| `src/pilotfish/core/capture/` | libpcap binding, `/dev/bpf` reader, capture thread |
+| `src/pilotfish/core/capture/` | libpcap binding, `/dev/bpf` reader, capture thread, interface counters, capture access |
 | `src/pilotfish/core/filters/` | capture filters: instructions, disassembler, interpreter |
 | `src/pilotfish/core/display/` | display filters: lexer, parser, type checker, evaluator, code generator |
 | `src/pilotfish/core/dissect/` | the dissector framework |
 | `src/pilotfish/core/protocols/` | one module per protocol |
 | `src/pilotfish/core/reassembly/` | fragments and TCP streams, put back in order |
 | `src/pilotfish/core/follow.py` | following a TCP stream |
-| `src/pilotfish/core/formats/` | pcap and pcapng: reading, writing, indexing, ring buffers and merging |
+| `src/pilotfish/core/formats/` | pcap and pcapng: reading, writing, indexing, streaming, ring buffers and merging |
 | `src/pilotfish/core/decoder.py` | decoding any packet on demand, from checkpoints |
 | `src/pilotfish/core/columns.py` | the packet list's columns, shared by both front ends |
 | `src/pilotfish/cli/` | command line tool: flags, the packet pipeline, text, JSON, fields and hex output |
-| `src/pilotfish/gui/` | PySide6 desktop app: the packet list, the protocol tree and the bytes |
+| `src/pilotfish/gui/` | PySide6 desktop app: the packet list, the protocol tree, the bytes, the filter bar and live capture |
+| `src/pilotfish/helper/` | the capture helper the app runs, which writes pcapng to a pipe |
 | `tests/`, `samples/`, `scripts/` | tests, capture files with answer keys, dev tools |
 
 The core is standard library only and never imports the CLI, the GUI or a
@@ -674,6 +735,7 @@ tests don't: their output for each sample is saved in the repo. See
 **Stage 4: The desktop app**
 
 - [x] Phase 13: the three-pane window
+- [x] Phase 14: live capture in the app
 
 ## Capture responsibly
 

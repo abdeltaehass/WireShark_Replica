@@ -35,7 +35,9 @@ _SOURCES: dict[Backend, Callable[[str, CaptureOptions], PacketSource]] = {
 }
 
 PERMISSION_HINT = (
-    "capturing needs access to /dev/bpf*, which only root has by default. Run pilotfish with sudo."
+    "capturing needs access to /dev/bpf*, which only root has by default. Run "
+    "`sudo pilotfish bpf-access install` once to capture without sudo from then on, "
+    "or run pilotfish itself with sudo."
 )
 
 

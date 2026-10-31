@@ -21,6 +21,7 @@ from pilotfish.core.decoder import (
 )
 from pilotfish.core.dissect import Node, ProtocolTree, Session, dissect
 from pilotfish.core.formats import CaptureFile, CaptureFileError, PacketIndex
+from pilotfish.core.packet import Packet
 
 SAMPLES_DIR = Path(__file__).resolve().parent.parent / "samples"
 CAPTURES = sorted(
@@ -186,3 +187,49 @@ def test_there_is_no_tree_past_the_end() -> None:
         with pytest.raises(IndexError, match="there is no packet 39; the file has 38"):
             decoder.tree(38)
         assert decoder.summary(38) is None
+
+
+def test_every_packet_is_shown_to_the_visitor_once_in_order() -> None:
+    capture = SAMPLES_DIR / "wireshark-wiki" / "http.cap"
+    expected = in_order(capture)
+    seen: list[tuple[int, tuple[object, ...]]] = []
+    with decoder_for(capture, spacing=4, summaries=2, trees=1) as decoder:
+        decoder.visit = lambda row, tree: seen.append((row, shape(tree)))
+        decoder.advance(9)
+        decoder.tree(20)  # decodes up to it
+        decoder.tree(3)  # decoded again from a checkpoint, which isn't news
+        decoder.summary(1)
+        decoder.advance(len(decoder))
+    assert seen == [(row, shape(tree)) for row, tree in enumerate(expected)]
+
+
+class Growing:
+    """Packets arriving as a live capture's do: more of them every so often."""
+
+    def __init__(self, packets: list[Packet]) -> None:
+        self.waiting = packets
+        self.arrived: list[Packet] = []
+
+    def arrive(self, count: int) -> None:
+        self.arrived += self.waiting[:count]
+        del self.waiting[:count]
+
+    def __len__(self) -> int:
+        return len(self.arrived)
+
+    def __getitem__(self, row: int) -> Packet:
+        return self.arrived[row]
+
+
+def test_a_capture_that_grows_is_decoded_as_it_grows() -> None:
+    capture = SAMPLES_DIR / "made" / "segments.pcap"
+    expected = in_order(capture)
+    with CaptureFile(capture) as file:
+        growing = Growing(list(file))
+    decoder = Decoder(growing, spacing=3)
+    assert decoder.advance(100) == 0
+    while growing.waiting:
+        growing.arrive(4)
+        assert decoder.advance(100) == len(growing)
+    for row in reversed(range(len(expected))):
+        assert shape(decoder.tree(row)) == shape(expected[row])

@@ -19,7 +19,7 @@ import pilotfish.core
 CORE_DIR = Path(pilotfish.core.__file__).parent
 SRC_DIR = CORE_DIR.parent.parent
 ALLOWED_THIRD_PARTY = frozenset({"cryptography"})
-FRONT_ENDS = frozenset({"cli", "gui"})
+FRONT_ENDS = frozenset({"cli", "gui", "helper"})
 
 
 def imported_modules(source: str, package: str) -> Iterator[str]:

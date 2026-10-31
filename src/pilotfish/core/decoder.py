@@ -26,11 +26,12 @@ import bisect
 import pickle
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass, replace
+from typing import Protocol
 
 from pilotfish.core.columns import addresses, protocol, summary
 from pilotfish.core.dissect import REGISTRY, ProtocolTree, Registry, Session, dissect
-from pilotfish.core.formats.index import PacketIndex
 from pilotfish.core.packet import Packet
 
 CHECKPOINT_SPACING = 1_000
@@ -70,12 +71,29 @@ class Summary:
         )
 
 
+class Packets(Protocol):
+    """Where a decoder reads packets from: a file's :class:`PacketIndex`, or
+    the :class:`PcapngStream` of a live capture, which grows as it runs."""
+
+    def __len__(self) -> int: ...
+
+    def __getitem__(self, row: int) -> Packet: ...
+
+
+type Visitor = Callable[[int, ProtocolTree], None]
+"""Called with each row and its tree as decoding in order reaches it."""
+
+
 class Decoder:
-    """The packets of an index, decoded as they are asked for."""
+    """The packets of an index, decoded as they are asked for.
+
+    The index may grow while the decoder works, as a live capture's does:
+    decoding in order simply has further to go.
+    """
 
     def __init__(
         self,
-        index: PacketIndex,
+        index: Packets,
         *,
         registry: Registry = REGISTRY,
         spacing: int = CHECKPOINT_SPACING,
@@ -83,8 +101,12 @@ class Decoder:
         checkpoint_bytes: int = CHECKPOINT_BYTES,
         summaries: int = SUMMARIES_KEPT,
         trees: int = TREES_KEPT,
+        visit: Visitor | None = None,
     ) -> None:
         self.index = index
+        self.visit = visit
+        """Shown every packet's tree once, as decoding in order reaches it,
+        which is how a display filter sees every packet without keeping any."""
         self._registry = registry
         self._spacing = spacing
         self._max_checkpoints = max(checkpoints, 1)
@@ -174,6 +196,8 @@ class Decoder:
         tree = self._decode(row, self._session)
         self._keep_summary(row, Summary.of(tree))
         self._decoded += 1
+        if self.visit is not None:
+            self.visit(row, tree)
         return tree
 
     def _decode(self, row: int, session: Session) -> ProtocolTree:

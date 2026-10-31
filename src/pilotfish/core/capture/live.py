@@ -2,6 +2,7 @@
 
 import queue
 import threading
+import time
 from collections.abc import Iterator
 from types import TracebackType
 from typing import Self
@@ -30,16 +31,28 @@ class LiveCapture:
     iteration then raises the error.
 
     The capture takes ownership of ``source`` and closes it when it stops.
+
+    With ``stats_every``, the kernel's counters are also read that often
+    while the capture runs, from the capture thread, since a source may only
+    be used from one thread at a time.
     """
 
-    def __init__(self, source: PacketSource, queue_size: int = DEFAULT_QUEUE_SIZE) -> None:
+    def __init__(
+        self,
+        source: PacketSource,
+        queue_size: int = DEFAULT_QUEUE_SIZE,
+        *,
+        stats_every: float | None = None,
+    ) -> None:
         self.source = source
+        self._stats_every = stats_every
         self.received = 0
         """Packets read from the source."""
         self.dropped = 0
         """Packets thrown away because the queue was full."""
         self.kernel_stats: KernelStats | None = None
-        """The kernel's counters, read as the capture stopped. ``None`` if unavailable."""
+        """The kernel's counters, read as the capture stopped, and every
+        ``stats_every`` seconds before that. ``None`` if unavailable."""
         self.error: Exception | None = None
         """What stopped the capture, if it failed."""
         self._queue: queue.Queue[Packet] = queue.Queue(maxsize=queue_size)
@@ -90,9 +103,14 @@ class LiveCapture:
     def _run(self) -> None:
         source = self.source
         put = self._queue.put_nowait
+        every = self._stats_every
+        next_stats = time.monotonic() + every if every else None
         try:
             while not self._stopping.is_set():
                 packet = source.read()
+                if next_stats is not None and every and time.monotonic() >= next_stats:
+                    self.kernel_stats = source.stats()
+                    next_stats = time.monotonic() + every
                 if packet is None:
                     continue
                 self.received += 1

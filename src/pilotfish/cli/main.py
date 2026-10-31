@@ -24,16 +24,31 @@ from typing import NoReturn, TextIO
 
 import pilotfish.core.protocols  # noqa: F401  (registers the dissectors)
 from pilotfish import __version__
-from pilotfish.cli import capture, explain, fields, follow, interfaces, merge, read
+from pilotfish.cli import bpf_access, capture, explain, fields, follow, interfaces, merge, read
 from pilotfish.cli.export import FieldPicker, FieldsFormat, FieldsPrinter, JsonPrinter
 from pilotfish.cli.pipeline import Pipeline, Printer, TextPrinter, open_output
 from pilotfish.cli.status import CommandError, Exit
 from pilotfish.cli.table import TIME_FORMATS
-from pilotfish.core.capture import DEFAULT_QUEUE_SIZE, MAX_SNAPLEN, CaptureOptions, PacketSource
+from pilotfish.core.capture import (
+    DEFAULT_QUEUE_SIZE,
+    MAX_SNAPLEN,
+    CaptureOptions,
+    PacketSource,
+    access,
+)
 from pilotfish.core.dissect import REGISTRY
 from pilotfish.core.formats import CaptureWriter, FileFormat, RingBuffer, RingLimits, open_writer
 
-COMMANDS = ("read", "capture", "merge", "follow", "fields", "interfaces", "filter")
+COMMANDS = (
+    "read",
+    "capture",
+    "merge",
+    "follow",
+    "fields",
+    "interfaces",
+    "filter",
+    "bpf-access",
+)
 
 OUTPUT_TYPES = ("text", "fields", "json")
 
@@ -362,6 +377,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     filter_parser.add_argument("expression", help="display filter, such as 'tcp.port == 80'")
 
+    access_parser = commands.add_parser(
+        "bpf-access",
+        help="let you capture without sudo, as Wireshark's ChmodBPF does",
+        description="Capturing reads /dev/bpf*, which only root can read. install adds a "
+        f"launch daemon that lets the {access.GROUP} group read them at every boot, and "
+        "adds you to the group; it needs sudo once. status says how things stand.",
+    )
+    access_parser.add_argument("action", choices=bpf_access.ACTIONS, nargs="?", default="status")
+    access_parser.add_argument("--user", help="who to add to the group (default: whoever ran sudo)")
+
     merge_parser = commands.add_parser(
         "merge",
         help="merge capture files into one, in time order, as mergecap does",
@@ -430,6 +455,8 @@ def _run(args: argparse.Namespace) -> Exit:
             return interfaces.run()
         case "filter":
             return explain.run(args.expression)
+        case "bpf-access":
+            return bpf_access.run(args.action, args.user)
         case "merge":
             return merge.run(
                 args.files,

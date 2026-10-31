@@ -7,6 +7,7 @@ from pilotfish.core.formats.pcap import PcapHeader, PcapReader
 from pilotfish.core.formats.pcapng import PcapngReader
 from pilotfish.core.formats.reader import CaptureFile, FileFormat, reader_for
 from pilotfish.core.formats.ring import RingBuffer, RingLimits
+from pilotfish.core.formats.stream import PcapngStream
 from pilotfish.core.formats.writer import (
     CaptureWriter,
     PcapngWriter,
@@ -27,6 +28,7 @@ __all__ = [
     "PcapReader",
     "PcapWriter",
     "PcapngReader",
+    "PcapngStream",
     "PcapngWriter",
     "RingBuffer",
     "RingLimits",
